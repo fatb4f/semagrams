@@ -50,6 +50,11 @@ package patchplan
 	phase:       "live" | "candidate"
 	errorCount:  int & >=0
 	diagnostics: [...#Diagnostic]
+
+	_errorDiagnostics: [
+		for d in diagnostics if d.severity == "error" {d},
+	]
+	errorCount: len(_errorDiagnostics)
 }
 
 #LSPFacts: {
@@ -58,6 +63,11 @@ package patchplan
 	adapterOK:   bool
 	errorCount:  int & >=0
 	diagnostics: [...#Diagnostic]
+
+	_errorDiagnostics: [
+		for d in diagnostics if d.severity == "error" {d},
+	]
+	errorCount: len(_errorDiagnostics)
 
 	symbols?: [...{
 		name: string
@@ -72,6 +82,15 @@ package patchplan
 
 	semanticNodes?: [...#SemanticNode]
 	semanticEdges?: [...#SemanticEdge]
+	semanticSummary?: #SemanticSummary
+
+	if semanticNodes != _|_ {
+		_semanticDiagnosticNodes: [
+			for n in semanticNodes if n.kind == "diagnostic" {n},
+		]
+		_semanticDiagnosticCount: len(_semanticDiagnosticNodes)
+		_semanticDiagnosticCount: len(diagnostics)
+	}
 }
 
 #SemanticNode: {
@@ -92,6 +111,16 @@ package patchplan
 	from: string
 	to:   string
 	kind: "resolves-to" | "diagnoses" | "references"
+}
+
+#SemanticSummary: {
+	loggerReferenceCount:        int & >=0
+	resolvedLoggerReferenceCount: int & >=0
+	unresolvedLoggerReferences:  [...string]
+	duplicateNodeIDs:            [...string]
+	deterministicOrder:          bool
+	allLoggerReferencesResolved: bool
+	allResolveTargetsKnown:      bool
 }
 
 #VCSFacts: {
@@ -136,7 +165,7 @@ package patchplan
 	id:          string
 	title:       string
 	order:       int & >=1
-	obligations: [...string]
+	obligations: [string, ...string]
 	produces?:   [...string]
 	consumes?:   [...string]
 	description: string
@@ -168,6 +197,10 @@ package patchplan
 		lspAdapterOK:       bool
 		lspErrorCount:      int & >=0
 		diffNonEmpty:       bool
+		allLoggerReferencesResolved: bool
+		allResolveTargetsKnown:      bool
+		noDuplicateSemanticNodeIDs:  bool
+		semanticOrderDeterministic:  bool
 	}
 
 	accepted: bool
@@ -178,7 +211,23 @@ package patchplan
 		candidate.compilerErrorCount == 0 &&
 		candidate.lspAdapterOK &&
 		candidate.lspErrorCount == 0 &&
-		candidate.diffNonEmpty
+		candidate.diffNonEmpty &&
+		candidate.allLoggerReferencesResolved &&
+		candidate.allResolveTargetsKnown &&
+		candidate.noDuplicateSemanticNodeIDs &&
+		candidate.semanticOrderDeterministic
+}
+
+#ReportInput: {
+	live:      #Facts & {phase: "live"}
+	candidate: #Facts & {phase: "candidate"}
+	compiler:  #CompilerFacts & {phase: "candidate"}
+	lsp:       #LSPFacts & {phase: "candidate"}
+	vcs:       #VCSFacts & {phase: "candidate"}
+
+	compiler: {
+		errorCount: lsp.errorCount
+	}
 }
 
 facts?:          #Facts
@@ -189,3 +238,4 @@ graph?:          #Graph
 candidateModel?: #CandidateModel
 patchPlan?:      #PatchPlan
 report?:         #Report
+reportInput?:    #ReportInput

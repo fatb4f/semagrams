@@ -2,8 +2,9 @@
 set -euo pipefail
 
 mode="${1:-good}"
+tier="${2:-report}"
 if [ "$mode" != "good" ] && [ "$mode" != "bad" ]; then
-  printf 'usage: patchplan/scripts/demo [good|bad]\n' >&2
+  printf 'usage: patchplan/scripts/demo [good|bad] [tier]\n' >&2
   exit 2
 fi
 
@@ -15,9 +16,10 @@ fi
 
 rm -rf patchplan/out
 mkdir -p patchplan/out/live/source patchplan/out/candidate patchplan/out/graph patchplan/out/reports
-cp package.json tsconfig.json patchplan/out/live/source/
+live_source_root="${PATCHPLAN_LIVE_SOURCE_ROOT:-.}"
+cp "$live_source_root/package.json" "$live_source_root/tsconfig.json" patchplan/out/live/source/
 mkdir -p patchplan/out/live/source/src
-cp -R src/. patchplan/out/live/source/src/
+cp -R "$live_source_root/src"/. patchplan/out/live/source/src/
 
 patchplan/scripts/extract-cst-facts live patchplan/out/live/source patchplan/out/live/cst.json
 cue vet patchplan/cue/schema.cue patchplan/out/live/cst.json
@@ -45,7 +47,7 @@ patchplan/scripts/extract-cst-facts candidate patchplan/out/candidate/source pat
 patchplan/scripts/extract-compiler-facts candidate patchplan/out/candidate/source patchplan/out/candidate/compiler.json
 patchplan/scripts/extract-lsp-facts candidate patchplan/out/candidate/source patchplan/out/candidate/lsp.json
 patchplan/scripts/extract-vcs-facts candidate patchplan/out/live/source patchplan/out/candidate/source patchplan/out/candidate/vcs.json
-patchplan/scripts/validate "$mode"
+patchplan/scripts/validate "$mode" "$tier"
 
 python3 - <<'PY'
 import json

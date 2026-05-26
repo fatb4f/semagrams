@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-ordered-symbols.$$"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp/reports" "$tmp/medium/src" "$tmp/large/src/generated"
+
+copy_project_files() {
+  local root="$1"
+  cp package.json tsconfig.json "$root"/
+}
+
+write_medium_fixture() {
+  copy_project_files "$tmp/medium"
+  cat > "$tmp/medium/src/app.ts" <<'TS'
+export function run(user: { id: string }) {
+  console.log(user.id)
+}
+TS
+  cat > "$tmp/medium/src/worker.ts" <<'TS'
+export function work(user: { id: string }) {
+  console.error("worker", user.id)
+}
+TS
+  cat > "$tmp/medium/src/service.ts" <<'TS'
+export function serve(user: { id: string }) {
+  console.log("service", user.id)
+}
+TS
+}
+
+write_large_fixture() {
+  copy_project_files "$tmp/large"
+  cat > "$tmp/large/src/app.ts" <<'TS'
+export function run(user: { id: string }) {
+  console.log(user.id)
+}
+TS
+  for i in $(seq -w 1 50); do
+    cat > "$tmp/large/src/generated/case-$i.ts" <<TS
+export function case$i(user: { id: string }) {
+  console.log("case-$i", user.id)
+}
+TS
+  done
+}
+
+stash_report() {
+  local tier="$1"
+  cp patchplan/out/reports/ordered-symbols/report.json "$tmp/reports/$tier.json"
+  cp patchplan/out/reports/ordered-symbols/report.md "$tmp/reports/$tier.md"
+}
+
+write_medium_fixture
+write_large_fixture
+
+patchplan/scripts/demo bad failure-domain
+stash_report failure-domain
+
+patchplan/scripts/demo good tiny
+stash_report tiny
+
+PATCHPLAN_LIVE_SOURCE_ROOT="$tmp/medium" patchplan/scripts/demo good medium
+stash_report medium
+
+PATCHPLAN_LIVE_SOURCE_ROOT="$tmp/large" patchplan/scripts/demo good large
+stash_report large
+
+mkdir -p patchplan/out/reports/ordered-symbols
+cp "$tmp/reports"/* patchplan/out/reports/ordered-symbols/
+
+printf 'ordered-symbol reports:\n'
+printf '  patchplan/out/reports/ordered-symbols/failure-domain.json\n'
+printf '  patchplan/out/reports/ordered-symbols/tiny.json\n'
+printf '  patchplan/out/reports/ordered-symbols/medium.json\n'
+printf '  patchplan/out/reports/ordered-symbols/large.json\n'

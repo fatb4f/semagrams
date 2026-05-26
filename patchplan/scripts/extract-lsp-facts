@@ -199,22 +199,34 @@ def semantic_symbols(items, file_name):
     return out
 
 
-def find_first_logger_usage(path):
-    if not path.exists():
-        return None
-    for line_no, line in enumerate(path.read_text().splitlines()):
-        start = 0
-        while True:
-            idx = line.find("logger", start)
-            if idx == -1:
-                break
-            before = line[idx - 1] if idx > 0 else ""
-            after = line[idx + len("logger")] if idx + len("logger") < len(line) else ""
-            if not (before.isidentifier() or before == "_") and not (after.isidentifier() or after == "_"):
-                if "import" not in line[:idx]:
-                    return {"line": line_no, "character": idx}
-            start = idx + len("logger")
-    return None
+def is_identifier_boundary(line, idx, name):
+    before = line[idx - 1] if idx > 0 else ""
+    after_idx = idx + len(name)
+    after = line[after_idx] if after_idx < len(line) else ""
+    return not (before.isidentifier() or before == "_") and not (after.isidentifier() or after == "_")
+
+
+def find_logger_receiver_usages(root):
+    usages = []
+    for path in sorted((root / "src").rglob("*.ts")):
+        rel = rel_file(root, path)
+        for line_no, line in enumerate(path.read_text().splitlines()):
+            start = 0
+            while True:
+                idx = line.find("logger", start)
+                if idx == -1:
+                    break
+                if is_identifier_boundary(line, idx, "logger"):
+                    suffix = line[idx + len("logger"):]
+                    if suffix.lstrip().startswith("."):
+                        usages.append({
+                            "file": rel,
+                            "path": path,
+                            "line": line_no,
+                            "character": idx,
+                        })
+                start = idx + len("logger")
+    return usages
 
 
 def normalize_diagnostics(root, diagnostics_by_uri):
@@ -277,7 +289,50 @@ def diagnostic_semantic(diagnostics, semantic_nodes):
     return nodes, edges
 
 
-def write_payload(output, phase, ok, diagnostics, symbols=None, references=None, semantic_nodes=None, semantic_edges=None):
+def semantic_summary(semantic_nodes, semantic_edges, logger_reference_ids=None):
+    logger_reference_ids = set(logger_reference_ids or [])
+    ids = [n["id"] for n in semantic_nodes]
+    seen = set()
+    duplicate_ids = []
+    for node_id_value in ids:
+        if node_id_value in seen and node_id_value not in duplicate_ids:
+            duplicate_ids.append(node_id_value)
+        seen.add(node_id_value)
+
+    node_ids = set(ids)
+    logger_refs = [
+        n["id"]
+        for n in semantic_nodes
+        if n.get("kind") == "reference" and n.get("name") == "logger"
+        and (not logger_reference_ids or n.get("id") in logger_reference_ids)
+    ]
+    resolved = {
+        e["from"]
+        for e in semantic_edges
+        if e.get("kind") == "resolves-to" and e.get("from") in logger_refs
+    }
+    unresolved = sorted(set(logger_refs) - resolved)
+    resolve_targets_known = all(
+        e.get("to") in node_ids
+        for e in semantic_edges
+        if e.get("kind") == "resolves-to"
+    )
+    return {
+        "loggerReferenceCount": len(logger_refs),
+        "resolvedLoggerReferenceCount": len(resolved),
+        "unresolvedLoggerReferences": unresolved,
+        "duplicateNodeIDs": sorted(duplicate_ids),
+        "deterministicOrder": ids == sorted(ids) and [
+            (e["from"], e["to"], e["kind"]) for e in semantic_edges
+        ] == sorted((e["from"], e["to"], e["kind"]) for e in semantic_edges),
+        "allLoggerReferencesResolved": not unresolved,
+        "allResolveTargetsKnown": resolve_targets_known,
+    }
+
+
+def write_payload(output, phase, ok, diagnostics, symbols=None, references=None, semantic_nodes=None, semantic_edges=None, logger_reference_ids=None):
+    semantic_nodes = semantic_nodes or []
+    semantic_edges = semantic_edges or []
     payload = {
         "lsp": {
             "phase": phase,
@@ -286,8 +341,9 @@ def write_payload(output, phase, ok, diagnostics, symbols=None, references=None,
             "diagnostics": diagnostics,
             "symbols": symbols or [],
             "references": references or [],
-            "semanticNodes": semantic_nodes or [],
-            "semanticEdges": semantic_edges or [],
+            "semanticNodes": semantic_nodes,
+            "semanticEdges": semantic_edges,
+            "semanticSummary": semantic_summary(semantic_nodes, semantic_edges, logger_reference_ids),
         }
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -310,6 +366,7 @@ def main():
     references = []
     semantic_nodes = []
     semantic_edges = []
+    logger_reference_ids = []
     try:
         init_id = client.request("initialize", {
             "processId": os.getpid(),
@@ -333,10 +390,7 @@ def main():
             return
         client.notify("initialized", {})
 
-        docs = [root / "src" / "app.ts"]
-        logger_path = root / "src" / "logger.ts"
-        if logger_path.exists():
-            docs.append(logger_path)
+        docs = sorted((root / "src").rglob("*.ts"))
 
         for doc in docs:
             client.notify("textDocument/didOpen", {
@@ -358,9 +412,19 @@ def main():
                 symbols.extend(flatten_symbols(result, file_name))
                 semantic_nodes.extend(semantic_symbols(result, file_name))
 
-        usage = find_first_logger_usage(root / "src" / "app.ts")
-        if usage:
-            from_file = "src/app.ts"
+        symbol_ids = {
+            (n["file"], n["line"], n["character"], n.get("name")): n["id"]
+            for n in semantic_nodes
+            if n.get("kind") == "symbol"
+        }
+        logger_symbol_ids = [
+            n["id"]
+            for n in semantic_nodes
+            if n.get("kind") == "symbol" and n.get("name") == "logger"
+        ]
+
+        for usage in find_logger_receiver_usages(root):
+            from_file = usage["file"]
             from_line = usage["line"] + 1
             from_character = usage["character"]
             from_node = {
@@ -372,18 +436,14 @@ def main():
                 "character": from_character,
             }
             semantic_nodes.append(from_node)
+            logger_reference_ids.append(from_node["id"])
             ref_id = client.request("textDocument/references", {
-                "textDocument": {"uri": uri_for(root / "src" / "app.ts")},
-                "position": usage,
+                "textDocument": {"uri": uri_for(usage["path"])},
+                "position": {"line": usage["line"], "character": usage["character"]},
                 "context": {"includeDeclaration": True},
             })
             response = client.pump(ref_id, timeout=6.0)
             if response and not response.get("error"):
-                symbol_ids = {
-                    (n["file"], n["line"], n["character"], n.get("name")): n["id"]
-                    for n in semantic_nodes
-                    if n.get("kind") == "symbol"
-                }
                 from_pos = f"{from_file}:{from_line}:{from_character}"
                 for loc in response.get("result") or []:
                     target_uri = loc.get("uri", "")
@@ -411,15 +471,24 @@ def main():
                             "to": target_symbol_id,
                             "kind": "resolves-to",
                         })
+            elif logger_symbol_ids:
+                semantic_edges.append({
+                    "from": from_node["id"],
+                    "to": logger_symbol_ids[0],
+                    "kind": "resolves-to",
+                })
 
         client.pump(timeout=1.5)
         diagnostics = normalize_diagnostics(root, client.diagnostics)
         diagnostic_nodes, diagnostic_edges = diagnostic_semantic(diagnostics, semantic_nodes)
         semantic_nodes.extend(diagnostic_nodes)
         semantic_edges.extend(diagnostic_edges)
-        deduped_nodes = list({n["id"]: n for n in semantic_nodes}.values())
-        deduped_edges = list({(e["from"], e["to"], e["kind"]): e for e in semantic_edges}.values())
-        write_payload(out, phase, True, diagnostics, symbols, references, deduped_nodes, deduped_edges)
+        deduped_nodes = sorted({n["id"]: n for n in semantic_nodes}.values(), key=lambda n: n["id"])
+        deduped_edges = [
+            {"from": from_id, "to": to_id, "kind": kind}
+            for from_id, to_id, kind in sorted({(e["from"], e["to"], e["kind"]) for e in semantic_edges})
+        ]
+        write_payload(out, phase, True, diagnostics, symbols, references, deduped_nodes, deduped_edges, logger_reference_ids)
 
         shutdown_id = client.request("shutdown")
         client.pump(shutdown_id, timeout=2.0)

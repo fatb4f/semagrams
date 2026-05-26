@@ -77,6 +77,23 @@ diagnosticFallbackRequiresEdges: [
 	},
 ]
 
+unresolvedLoggerNodes: [
+	if lsp.semanticSummary != _|_ for refID in lsp.semanticSummary.unresolvedLoggerReferences {
+		id:    "unresolved:\(refID)"
+		kind:  "unresolved-reference"
+		label: "unresolved logger reference: \(refID)"
+	},
+]
+
+unresolvedLoggerEdges: [
+	if lsp.semanticSummary != _|_ for refID in lsp.semanticSummary.unresolvedLoggerReferences {
+		from:  refID
+		to:    "unresolved:\(refID)"
+		kind:  "conflicts"
+		label: "logger reference has no resolves-to edge"
+	},
+]
+
 patchPlan: #PatchPlan & {
 	patchLayers: [
 		{
@@ -145,9 +162,9 @@ patchLayerImplementsEdges: [
 ]
 
 graph: #Graph & {
-	nodes: list.Concat([primitiveNodes, obligationNodes, lspSemanticNodes, patchLayerNodes])
+	nodes: list.Concat([primitiveNodes, obligationNodes, lspSemanticNodes, unresolvedLoggerNodes, patchLayerNodes])
 
-	edges: list.Concat([consoleRewriteEdges, lspSemanticEdges, diagnosticRequiresEdges, diagnosticFallbackRequiresEdges, patchLayerOrderEdges, patchLayerImplementsEdges, [
+	edges: list.Concat([consoleRewriteEdges, lspSemanticEdges, diagnosticRequiresEdges, diagnosticFallbackRequiresEdges, unresolvedLoggerEdges, patchLayerOrderEdges, patchLayerImplementsEdges, [
 		{
 			from:  "obligation:rewrite-console-calls"
 			to:    "obligation:provide-logger-binding"

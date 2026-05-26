@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-contradictions.$$"
+out="patchplan/out/reports/contradictions"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp/good"
+
+copy_artifacts() {
+  local dest="$1"
+  mkdir -p "$dest"
+  cp patchplan/out/reports/report-input.json "$dest/report-input.json"
+  cp patchplan/out/candidate/compiler.json "$dest/compiler.json"
+  cp patchplan/out/candidate/lsp.json "$dest/lsp.json"
+}
+
+patchplan/scripts/demo good >/dev/null 2>&1
+copy_artifacts "$tmp/good"
+
+mkdir -p "$out/cases"
+
+python3 - "$tmp/good" "$out/cases" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+good = Path(sys.argv[1])
+cases = Path(sys.argv[2])
+
+def load(name):
+    return json.loads((good / name).read_text())
+
+def write(name, data):
+    (cases / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
+
+compiler = load("compiler.json")
+compiler["compiler"]["errorCount"] = 0
+compiler["compiler"]["diagnostics"] = [{
+    "file": "src/app.ts",
+    "line": 1,
+    "severity": "error",
+    "code": "TSCONTRA",
+    "message": "compiler contradiction",
+}]
+write("compiler-errorcount-zero-diagnostics-present", compiler)
+
+lsp = load("lsp.json")
+lsp["lsp"]["errorCount"] = 0
+lsp["lsp"]["diagnostics"] = [{
+    "file": "src/app.ts",
+    "line": 1,
+    "character": 0,
+    "severity": "error",
+    "code": "TSCONTRA",
+    "message": "lsp contradiction",
+}]
+write("lsp-errorcount-zero-diagnostics-present", lsp)
+
+compiler_clean_lsp_dirty = load("report-input.json")
+compiler_clean_lsp_dirty["reportInput"]["lsp"]["errorCount"] = 1
+compiler_clean_lsp_dirty["reportInput"]["lsp"]["diagnostics"] = [{
+    "file": "src/app.ts",
+    "line": 1,
+    "character": 0,
+    "severity": "error",
+    "code": "TSCONTRA",
+    "message": "lsp dirty while compiler clean",
+}]
+compiler_clean_lsp_dirty["reportInput"]["lsp"]["semanticNodes"].append({
+    "id": "diagnostic:src/app.ts:1:0:TSCONTRA",
+    "kind": "diagnostic",
+    "name": "TSCONTRA",
+    "code": "TSCONTRA",
+    "message": "lsp dirty while compiler clean",
+    "file": "src/app.ts",
+    "line": 1,
+    "character": 0,
+})
+write("compiler-clean-lsp-dirty", compiler_clean_lsp_dirty)
+
+lsp_clean_compiler_dirty = load("report-input.json")
+lsp_clean_compiler_dirty["reportInput"]["compiler"]["errorCount"] = 1
+lsp_clean_compiler_dirty["reportInput"]["compiler"]["diagnostics"] = [{
+    "file": "src/app.ts",
+    "line": 1,
+    "severity": "error",
+    "code": "TSCONTRA",
+    "message": "compiler dirty while lsp clean",
+}]
+write("lsp-clean-compiler-dirty", lsp_clean_compiler_dirty)
+
+semantic_node_lsp_clean = load("lsp.json")
+semantic_node_lsp_clean["lsp"]["errorCount"] = 0
+semantic_node_lsp_clean["lsp"]["diagnostics"] = []
+semantic_node_lsp_clean["lsp"]["semanticNodes"].append({
+    "id": "diagnostic:src/app.ts:1:0:TSCONTRA",
+    "kind": "diagnostic",
+    "name": "TSCONTRA",
+    "code": "TSCONTRA",
+    "message": "semantic diagnostic with clean LSP",
+    "file": "src/app.ts",
+    "line": 1,
+    "character": 0,
+})
+write("semantic-diagnostic-node-lsp-clean", semantic_node_lsp_clean)
+PY
+
+run_case() {
+  local name="$1"
+  shift
+  local log="$out/cases/$name.log"
+  if "$@" >"$log" 2>&1; then
+    printf '%s: unexpected-pass\n' "$name"
+    return 1
+  fi
+  printf '%s: rejected\n' "$name"
+}
+
+results="$out/failure-domain.txt"
+: > "$results"
+
+{
+  run_case compiler-errorcount-zero-diagnostics-present cue vet patchplan/cue/schema.cue "$out/cases/compiler-errorcount-zero-diagnostics-present.json"
+  run_case lsp-errorcount-zero-diagnostics-present cue vet patchplan/cue/schema.cue "$out/cases/lsp-errorcount-zero-diagnostics-present.json"
+  run_case compiler-clean-lsp-dirty cue vet patchplan/cue/schema.cue patchplan/cue/change.cue patchplan/cue/report.cue "$out/cases/compiler-clean-lsp-dirty.json"
+  run_case lsp-clean-compiler-dirty cue vet patchplan/cue/schema.cue patchplan/cue/change.cue patchplan/cue/report.cue "$out/cases/lsp-clean-compiler-dirty.json"
+  run_case semantic-diagnostic-node-lsp-clean cue vet patchplan/cue/schema.cue "$out/cases/semantic-diagnostic-node-lsp-clean.json"
+} | tee "$results"
+
+python3 - "$results" "$out/failure-domain.json" "$out/failure-domain.md" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results_path, json_path, md_path = map(Path, sys.argv[1:])
+rows = []
+for line in results_path.read_text().splitlines():
+    case, status = line.split(": ", 1)
+    rows.append({"case": case, "status": status})
+accepted = all(row["status"] == "rejected" for row in rows)
+payload = {
+    "slice": "compiler-lsp-contradictions",
+    "tier": "failure-domain",
+    "accepted": accepted,
+    "cases": rows,
+}
+json_path.write_text(json.dumps(payload, indent=2) + "\n")
+md_path.write_text(
+    "\n".join([
+        "# Compiler/LSP Contradictions",
+        "",
+        f"- tier: failure-domain",
+        f"- accepted: {str(accepted).lower()}",
+        *[f"- {row['case']}: {row['status']}" for row in rows],
+        "",
+    ])
+)
+if not accepted:
+    raise SystemExit(1)
+PY

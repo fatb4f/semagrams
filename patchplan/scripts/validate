@@ -2,8 +2,11 @@
 set -euo pipefail
 
 mode="${1:-good}"
+tier="${2:-report}"
 
 mkdir -p patchplan/out/graph patchplan/out/candidate patchplan/out/reports
+mkdir -p patchplan/out/reports/ordered-symbols
+mkdir -p patchplan/out/reports/graph-consistency
 
 cue vet patchplan/cue/schema.cue patchplan/out/live/cst.json
 cue vet patchplan/cue/schema.cue patchplan/out/candidate/cst.json
@@ -40,52 +43,143 @@ cue export \
   > patchplan/out/graph/patch-layers.json
 
 cue vet -d '#PatchPlan' patchplan/cue/schema.cue patchplan/out/graph/patch-layers.json
+cue vet patchplan/cue/schema.cue patchplan/cue/patch-integrity.cue patchplan/out/graph/patch-layers.json
 
 patchplan/scripts/graph-dot patchplan/out/graph/graph.json patchplan/out/graph/deps.dot
 
-python3 - "$mode" <<'PY'
+python3 - <<'PY'
 import json
-import sys
 from pathlib import Path
 
-mode = sys.argv[1]
 live = json.loads(Path("patchplan/out/live/cst.json").read_text())["facts"]
 candidate = json.loads(Path("patchplan/out/candidate/cst.json").read_text())["facts"]
 compiler = json.loads(Path("patchplan/out/candidate/compiler.json").read_text())["compiler"]
 lsp = json.loads(Path("patchplan/out/candidate/lsp.json").read_text())["lsp"]
 vcs = json.loads(Path("patchplan/out/candidate/vcs.json").read_text())["vcs"]
 
-report = {
-    "report": {
-        "changeID": "replace-console-with-logger",
-        "live": {
-            "consoleCallCount": live["counts"]["consoleCalls"],
-        },
-        "candidate": {
-            "consoleCallCount": candidate["counts"]["consoleCalls"],
-            "loggerCallCount": candidate["counts"]["loggerCalls"],
-            "hasLoggerBinding": candidate["hasLoggerBinding"],
-            "compilerErrorCount": compiler["errorCount"],
-            "lspAdapterOK": lsp["adapterOK"],
-            "lspErrorCount": lsp["errorCount"],
-            "diffNonEmpty": vcs["diffNonEmpty"],
-        },
+payload = {
+    "reportInput": {
+        "live": live,
+        "candidate": candidate,
+        "compiler": compiler,
+        "lsp": lsp,
+        "vcs": vcs,
     }
 }
-c = report["report"]["candidate"]
-report["report"]["accepted"] = (
-    c["consoleCallCount"] == 0
-    and c["loggerCallCount"] >= 1
-    and c["hasLoggerBinding"]
-    and c["compilerErrorCount"] == 0
-    and c["lspAdapterOK"]
-    and c["lspErrorCount"] == 0
-    and c["diffNonEmpty"]
-)
-Path("patchplan/out/reports").mkdir(parents=True, exist_ok=True)
-Path("patchplan/out/reports/report.json").write_text(json.dumps(report, indent=2) + "\n")
-print(f"accepted: {str(report['report']['accepted']).lower()}")
+Path("patchplan/out/reports/report-input.json").write_text(json.dumps(payload, indent=2) + "\n")
 PY
+
+cue vet patchplan/cue/schema.cue patchplan/cue/change.cue patchplan/cue/report.cue patchplan/out/reports/report-input.json
+cue export \
+  patchplan/cue/schema.cue \
+  patchplan/cue/change.cue \
+  patchplan/cue/report.cue \
+  patchplan/out/reports/report-input.json \
+  -e reportEnvelope \
+  --out json \
+  > patchplan/out/reports/report.json
+
+python3 - "$mode" "$tier" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+mode = sys.argv[1]
+tier = sys.argv[2]
+report = json.loads(Path("patchplan/out/reports/report.json").read_text())["report"]
+graph = json.loads(Path("patchplan/out/graph/graph.json").read_text())
+lsp = json.loads(Path("patchplan/out/candidate/lsp.json").read_text())["lsp"]
+semantic = lsp.get("semanticSummary", {})
+semantic_nodes = lsp.get("semanticNodes", [])
+semantic_edges = lsp.get("semanticEdges", [])
+
+diagnostic_nodes = [node for node in graph.get("nodes", []) if node.get("kind") == "diagnostic"]
+unresolved_nodes = [node for node in graph.get("nodes", []) if node.get("kind") == "unresolved-reference"]
+diagnoses_edges = [edge for edge in graph.get("edges", []) if edge.get("kind") == "diagnoses"]
+conflict_edges = [edge for edge in graph.get("edges", []) if edge.get("kind") == "conflicts"]
+resolves_to_edges = [edge for edge in graph.get("edges", []) if edge.get("kind") == "resolves-to"]
+patch_layer_nodes = [node for node in graph.get("nodes", []) if node.get("kind") == "patch-layer"]
+graph_report_input = {
+    "graph": graph,
+    "report": report,
+}
+Path("patchplan/out/reports/graph-consistency/input.json").write_text(json.dumps(graph_report_input, indent=2) + "\n")
+graph_consistency = {
+    "slice": "graph-report-consistency",
+    "mode": mode,
+    "tier": tier,
+    "accepted": report["accepted"],
+    "diagnosticNodeCount": len(diagnostic_nodes),
+    "unresolvedReferenceNodeCount": len(unresolved_nodes),
+    "diagnosesEdgeCount": len(diagnoses_edges),
+    "conflictEdgeCount": len(conflict_edges),
+    "resolvesToEdgeCount": len(resolves_to_edges),
+    "patchLayerNodeCount": len(patch_layer_nodes),
+}
+Path("patchplan/out/reports/graph-consistency/report.json").write_text(json.dumps(graph_consistency, indent=2) + "\n")
+graph_consistency_md = "\n".join([
+    "# Graph/Report Consistency",
+    "",
+    f"- mode: {mode}",
+    f"- tier: {tier}",
+    f"- accepted: {str(report['accepted']).lower()}",
+    f"- diagnostic nodes: {len(diagnostic_nodes)}",
+    f"- unresolved reference nodes: {len(unresolved_nodes)}",
+    f"- diagnoses edges: {len(diagnoses_edges)}",
+    f"- conflict edges: {len(conflict_edges)}",
+    f"- resolves-to edges: {len(resolves_to_edges)}",
+    f"- patch-layer nodes: {len(patch_layer_nodes)}",
+    "",
+])
+Path("patchplan/out/reports/graph-consistency/report.md").write_text(graph_consistency_md)
+if tier != "report":
+    Path(f"patchplan/out/reports/graph-consistency/{tier}.json").write_text(json.dumps(graph_consistency, indent=2) + "\n")
+    Path(f"patchplan/out/reports/graph-consistency/{tier}.md").write_text(graph_consistency_md)
+
+ordered_report = {
+    "slice": "ordered-symbols",
+    "mode": mode,
+    "tier": tier,
+    "accepted": report["accepted"],
+    "loggerReferenceCount": semantic.get("loggerReferenceCount", 0),
+    "resolvedLoggerReferenceCount": semantic.get("resolvedLoggerReferenceCount", 0),
+    "unresolvedLoggerReferences": semantic.get("unresolvedLoggerReferences", []),
+    "duplicateNodeIDs": semantic.get("duplicateNodeIDs", []),
+    "deterministicOrder": semantic.get("deterministicOrder", False),
+    "allResolveTargetsKnown": semantic.get("allResolveTargetsKnown", False),
+    "semanticNodeIDs": [node["id"] for node in semantic_nodes],
+    "resolvesToEdges": [
+        edge for edge in semantic_edges
+        if edge.get("kind") == "resolves-to"
+    ],
+}
+ordered_path = Path("patchplan/out/reports/ordered-symbols/report.json")
+ordered_path.write_text(json.dumps(ordered_report, indent=2) + "\n")
+ordered_markdown = (
+    "\n".join([
+        "# Ordered Symbols",
+        "",
+        f"- mode: {mode}",
+        f"- tier: {tier}",
+        f"- accepted: {str(ordered_report['accepted']).lower()}",
+        f"- logger references: {ordered_report['loggerReferenceCount']}",
+        f"- resolved logger references: {ordered_report['resolvedLoggerReferenceCount']}",
+        f"- unresolved logger references: {len(ordered_report['unresolvedLoggerReferences'])}",
+        f"- duplicate semantic node IDs: {len(ordered_report['duplicateNodeIDs'])}",
+        f"- deterministic order: {str(ordered_report['deterministicOrder']).lower()}",
+        f"- resolve targets known: {str(ordered_report['allResolveTargetsKnown']).lower()}",
+        "",
+    ])
+)
+ordered_md = Path("patchplan/out/reports/ordered-symbols/report.md")
+ordered_md.write_text(ordered_markdown)
+if tier != "report":
+    Path(f"patchplan/out/reports/ordered-symbols/{tier}.json").write_text(json.dumps(ordered_report, indent=2) + "\n")
+    Path(f"patchplan/out/reports/ordered-symbols/{tier}.md").write_text(ordered_markdown)
+print(f"accepted: {str(report['accepted']).lower()}")
+PY
+
+cue vet patchplan/cue/schema.cue patchplan/cue/integrity.cue patchplan/out/reports/graph-consistency/input.json
 
 if cue vet patchplan/cue/schema.cue patchplan/cue/accept.cue patchplan/out/reports/report.json; then
   printf 'cue acceptance check: pass\n'

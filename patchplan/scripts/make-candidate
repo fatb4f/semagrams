@@ -25,14 +25,24 @@ path.write_text(json.dumps(data, indent=2) + "\n")
 PY
 
 if [ "$mode" = "good" ]; then
-  python3 - "$candidate_root/src/app.ts" <<'PY'
+  python3 - "$candidate_root/src" <<'PY'
 from pathlib import Path
 import sys
-path = Path(sys.argv[1])
-text = path.read_text()
-text = 'import { logger } from "./logger"\n\n' + text
-text = text.replace("console.log", "logger.log").replace("console.error", "logger.error")
-path.write_text(text)
+src = Path(sys.argv[1])
+for path in sorted(src.rglob("*.ts")):
+    if path.name == "logger.ts":
+        continue
+    text = path.read_text()
+    if "console.log" not in text and "console.error" not in text:
+        continue
+    text = text.replace("console.log", "logger.log").replace("console.error", "logger.error")
+    rel_logger = Path("logger")
+    if path.parent != src:
+        rel_logger = Path(*([".."] * len(path.parent.relative_to(src).parts)), "logger")
+    import_line = f'import {{ logger }} from "./{rel_logger.as_posix()}"\n\n'
+    if 'import { logger } from ' not in text:
+        text = import_line + text
+    path.write_text(text)
 PY
   cat > "$candidate_root/src/logger.ts" <<'EOF'
 export const logger = {
@@ -41,10 +51,13 @@ export const logger = {
 }
 EOF
 else
-  python3 - "$candidate_root/src/app.ts" <<'PY'
+  python3 - "$candidate_root/src" <<'PY'
 from pathlib import Path
 import sys
-path = Path(sys.argv[1])
-path.write_text(path.read_text().replace("console.log", "logger.log"))
+src = Path(sys.argv[1])
+for path in sorted(src.rglob("*.ts")):
+    if path.name == "logger.ts":
+        continue
+    path.write_text(path.read_text().replace("console.log", "logger.log"))
 PY
 fi

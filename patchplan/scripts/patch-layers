@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-patch-layers.$$"
+out="patchplan/out/reports/patch-layers"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp"
+
+patchplan/scripts/demo good >/dev/null 2>&1
+cp patchplan/out/graph/patch-layers.json "$tmp/patch-layers.json"
+
+mkdir -p "$out/cases"
+
+python3 - "$tmp/patch-layers.json" "$out/cases" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+cases = Path(sys.argv[2])
+base = json.loads(source.read_text())
+
+def write(name, data):
+    (cases / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
+
+missing_obligation = json.loads(json.dumps(base))
+missing_obligation["patchLayers"][0]["obligations"] = ["obligation:unrelated"]
+write("missing-obligation-implementation", missing_obligation)
+
+orphan_layer = json.loads(json.dumps(base))
+orphan_layer["patchLayers"].append({
+    "id": "999-orphan",
+    "title": "Orphan layer",
+    "order": 99,
+    "obligations": [],
+    "description": "Does not implement an obligation.",
+})
+write("orphan-patch-layer", orphan_layer)
+
+missing_precede = json.loads(json.dumps(base))
+missing_precede["edges"] = [
+    edge for edge in missing_precede["edges"]
+    if not (edge["from"] == "001-provide-logger-binding" and edge["to"] == "002-rewrite-console-calls")
+]
+write("missing-must-precede", missing_precede)
+
+late_producer = json.loads(json.dumps(base))
+late_producer["patchLayers"][0]["order"] = 3
+write("producer-after-consumer", late_producer)
+PY
+
+run_case() {
+  local name="$1"
+  local log="$out/cases/$name.log"
+  if cue vet patchplan/cue/schema.cue patchplan/cue/patch-integrity.cue "$out/cases/$name.json" >"$log" 2>&1; then
+    printf '%s: unexpected-pass\n' "$name"
+    return 1
+  fi
+  printf '%s: rejected\n' "$name"
+}
+
+results="$out/failure-domain.txt"
+: > "$results"
+
+{
+  run_case missing-obligation-implementation
+  run_case orphan-patch-layer
+  run_case missing-must-precede
+  run_case producer-after-consumer
+} | tee "$results"
+
+python3 - "$results" "$out/failure-domain.json" "$out/failure-domain.md" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results_path, json_path, md_path = map(Path, sys.argv[1:])
+rows = []
+for line in results_path.read_text().splitlines():
+    case, status = line.split(": ", 1)
+    rows.append({"case": case, "status": status})
+accepted = all(row["status"] == "rejected" for row in rows)
+payload = {
+    "slice": "patch-layer-graph-consistency",
+    "tier": "failure-domain",
+    "accepted": accepted,
+    "cases": rows,
+}
+json_path.write_text(json.dumps(payload, indent=2) + "\n")
+md_path.write_text(
+    "\n".join([
+        "# Patch Layer Graph Consistency",
+        "",
+        f"- tier: failure-domain",
+        f"- accepted: {str(accepted).lower()}",
+        *[f"- {row['case']}: {row['status']}" for row in rows],
+        "",
+    ])
+)
+if not accepted:
+    raise SystemExit(1)
+PY
