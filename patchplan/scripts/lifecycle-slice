@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-lifecycle.$$"
+out="patchplan/out/reports"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp/reports"
+
+stash_reports() {
+  local name="$1"
+  local dir="$out/$name"
+  if [ -d "$dir" ]; then
+    mkdir -p "$tmp/reports/$name"
+    cp -R "$dir"/. "$tmp/reports/$name"/
+  fi
+}
+
+patchplan/scripts/topological-order-slice >/dev/null
+stash_reports topological-order
+
+patchplan/scripts/patch-emission-slice >/dev/null
+stash_reports patch-emission
+
+patchplan/scripts/patch-replay-slice >/dev/null
+stash_reports patch-replay
+
+patchplan/scripts/scope-policy-slice >/dev/null
+stash_reports scope-policy
+
+patchplan/scripts/idempotence-slice >/dev/null
+stash_reports idempotence
+
+mkdir -p "$out"
+cp -R "$tmp/reports"/* "$out"/
+
+python3 - "$tmp/reports" "$out/lifecycle.json" "$out/lifecycle.md" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+reports_root = Path(sys.argv[1])
+json_path = Path(sys.argv[2])
+md_path = Path(sys.argv[3])
+
+probe_meta = {
+    "topological-order": {
+        "failureDomain": "complexity",
+        "authority": "CUE topology validator over helper-produced order facts",
+        "artifacts": [
+            "patchplan/out/graph/patch-order.json",
+            "patchplan/out/reports/topological-order/*.json",
+        ],
+    },
+    "patch-emission": {
+        "failureDomain": "patch-materialization",
+        "authority": "CUE patch metadata validator plus ordered git apply --check fact",
+        "artifacts": [
+            "patchplan/out/patches/001-provide-logger-binding.patch",
+            "patchplan/out/patches/002-rewrite-console-calls.patch",
+            "patchplan/out/patches/manifest.json",
+            "patchplan/out/reports/patch-emission/*.json",
+        ],
+    },
+    "patch-replay": {
+        "failureDomain": "patch-materialization",
+        "authority": "fresh-base replay comparison against accepted candidate",
+        "artifacts": [
+            "patchplan/out/reports/patch-replay/*.json",
+        ],
+    },
+    "scope-policy": {
+        "failureDomain": "model-design",
+        "authority": "CUE scope policy requiring zero scope violations",
+        "artifacts": [
+            "patchplan/out/reports/scope-policy/*.json",
+            "patchplan/out/graph/graph.json scope-violation nodes for live validation failures",
+        ],
+    },
+    "idempotence": {
+        "failureDomain": "evidence-integrity",
+        "authority": "three-run artifact hash comparison and semantic ordering check",
+        "artifacts": [
+            "patchplan/out/reports/idempotence/*.json",
+        ],
+    },
+}
+
+tiers = ["failure-domain", "tiny", "medium", "large"]
+completed = []
+for probe, meta in probe_meta.items():
+    probe_dir = reports_root / probe
+    for tier in tiers:
+        path = probe_dir / f"{tier}.json"
+        if not path.exists():
+            completed.append({
+                "probe": probe,
+                "tier": tier,
+                "status": "missing",
+                "passed": False,
+                "failureDomain": meta["failureDomain"],
+                "authority": meta["authority"],
+                "artifacts": meta["artifacts"],
+            })
+            continue
+        data = json.loads(path.read_text())
+        passed = bool(data.get("accepted"))
+        completed.append({
+            "probe": probe,
+            "tier": tier,
+            "status": "pass" if passed else "fail",
+            "passed": passed,
+            "failureDomain": meta["failureDomain"],
+            "authority": meta["authority"],
+            "artifacts": meta["artifacts"],
+            "sourceReport": f"patchplan/out/reports/{probe}/{tier}.json",
+        })
+
+known_failed = {
+    "probe": "scope-policy",
+    "tier": "failure-domain",
+    "failureDomain": "model-design",
+    "status": "classified",
+    "description": "Out-of-scope touches to README.md, package.json, and src/vendor/* are rejected and represented as scope-violation graph nodes with conflicts edges.",
+    "authority": "CUE scope-policy.cue unification rejects non-empty scope violations.",
+}
+
+completion_answers = {
+    "isCandidateAccepted": "See patchplan/out/reports/report.json report.accepted.",
+    "whyOrWhyNot": "CUE-derived report fields explain acceptance predicates; failed overlays conflict in cue vet output.",
+    "supportingFacts": "CST, compiler, LSP, VCS, scope, patch manifest, and replay facts under patchplan/out/.",
+    "decisionEdges": "Graph edges in patchplan/out/graph/graph.json and deps.dot include requires, validates, conflicts, resolves-to, implements, and must-precede relationships.",
+    "patchLayerForMissingObligation": "patchplan/out/graph/patch-layers.json maps obligations to patch layers.",
+    "patchLayersReplayable": "patch-replay reports verify ordered patches reproduce the accepted candidate.",
+    "stableAcrossTiers": "idempotence reports verify stable hashes and semantic order across tiny, medium, and large tiers.",
+    "failureDomainWhenItFails": "Each lifecycle probe entry carries a failureDomain; known failed scope-policy case is classified as model-design.",
+}
+
+all_passed = all(item["passed"] for item in completed)
+payload = {
+    "slice": "lifecycle",
+    "accepted": all_passed,
+    "completedProbes": completed,
+    "knownFailedProbe": known_failed,
+    "greenLightAuthority": "CUE remains the acceptance authority: scripts emit facts, CUE validates/derives/gates acceptance.",
+    "knownLimitations": [
+        "LSP adapter is still a focused semantic/reference boundary, not a full language-intelligence layer.",
+        "Patch emission is tailored to the logger migration patch layers.",
+        "Scope policy uses the declared TypeScript source scope for this probe, not a general policy language.",
+        "No FUSE, agent workflow, multi-language support, or universal refactoring engine is implemented.",
+    ],
+    "nextRecommendedProbe": "Promote fixture-specific layer and scope rules into reusable policy inputs while keeping CUE as the green-light authority.",
+    "completionAnswers": completion_answers,
+    "reassessment": "The probe is now more than a single fixture proof: it is a reusable patch-planning substrate for this migration shape, with explicit remaining specialization in patch emission and scope policy.",
+}
+
+json_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+lines = [
+    "# Lifecycle Report",
+    "",
+    f"- accepted: {str(payload['accepted']).lower()}",
+    f"- green-light authority: {payload['greenLightAuthority']}",
+    f"- next recommended probe: {payload['nextRecommendedProbe']}",
+    "",
+    "## Completed Probes",
+    "",
+]
+for item in completed:
+    lines.append(f"- {item['probe']} / {item['tier']}: {item['status']} ({item['failureDomain']})")
+lines.extend([
+    "",
+    "## Known Failed Probe",
+    "",
+    f"- probe: {known_failed['probe']}",
+    f"- tier: {known_failed['tier']}",
+    f"- domain: {known_failed['failureDomain']}",
+    f"- explanation: {known_failed['description']}",
+    "",
+    "## Limitations",
+    "",
+])
+lines.extend(f"- {item}" for item in payload["knownLimitations"])
+lines.extend([
+    "",
+    "## Reassessment",
+    "",
+    payload["reassessment"],
+    "",
+])
+md_path.write_text("\n".join(lines))
+PY
+
+printf 'lifecycle reports:\n'
+printf '  patchplan/out/reports/lifecycle.json\n'
+printf '  patchplan/out/reports/lifecycle.md\n'
