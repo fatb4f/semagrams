@@ -1,0 +1,11 @@
+{
+  "name": "patchplan-probe",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit --pretty false"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

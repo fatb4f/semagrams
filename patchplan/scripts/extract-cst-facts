@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run(cmd, cwd=None, check=False):
+    proc = subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and proc.returncode != 0:
+        raise SystemExit(proc.stderr or proc.stdout)
+    return proc
+
+
+def git_cmd():
+    root = Path.cwd()
+    alt = root / ".patchplan-git"
+    if alt.exists():
+        return ["git", f"--git-dir={alt}", f"--work-tree={root}"]
+    return ["git"]
+
+
+def git_value(args, cwd, fallback=""):
+    proc = run([*git_cmd(), *args], cwd=cwd)
+    return proc.stdout.strip() if proc.returncode == 0 else fallback
+
+
+def sg_json(sg, pattern, source):
+    proc = run([sg, "run", "-p", pattern, "--lang", "ts", "--json=compact", str(source)])
+    if proc.returncode not in (0, 1):
+        raise SystemExit(proc.stderr or proc.stdout)
+    out = proc.stdout.strip()
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"failed to parse ast-grep JSON: {exc}\n{out}")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("matches", [data] if "text" in data else [])
+    return []
+
+
+def line_of(match):
+    rng = match.get("range") or {}
+    start = rng.get("start") or match.get("start") or {}
+    return int(start.get("line", 0)) + 1
+
+
+def file_of(match, source):
+    path = match.get("file") or match.get("path") or match.get("filePath") or ""
+    if not path:
+        return ""
+    try:
+        return str(Path(path).resolve().relative_to(source.resolve()))
+    except ValueError:
+        return str(path)
+
+
+def text_of(match):
+    return (match.get("text") or match.get("match") or "").strip()
+
+
+def method_for(text, receiver):
+    m = re.search(rf"\b{re.escape(receiver)}\.([A-Za-z_$][\w$]*)\s*\(", text)
+    return m.group(1) if m else ""
+
+
+def binding_primitives(source):
+    patterns = [
+        re.compile(r'import\s*\{\s*logger\s*\}\s*from\s*["\']\.\/logger["\']'),
+        re.compile(r'export\s+const\s+logger\s*='),
+        re.compile(r'(?<!export\s)const\s+logger\s*='),
+    ]
+    out = []
+    for path in sorted(source.rglob("*.ts")):
+        rel = str(path.relative_to(source))
+        for idx, line in enumerate(path.read_text().splitlines(), start=1):
+            if any(p.search(line) for p in patterns):
+                out.append({
+                    "id": f"binding:{rel}:{idx}:logger",
+                    "file": rel,
+                    "kind": "binding",
+                    "line": idx,
+                    "text": line.strip(),
+                    "name": "logger",
+                })
+    return out
+
+
+def main():
+    if len(sys.argv) != 4 or sys.argv[1] not in ("live", "candidate"):
+        raise SystemExit("usage: extract-cst-facts live|candidate <source-root> <output-file>")
+    phase, source_s, output_s = sys.argv[1:]
+    source = Path(source_s).resolve()
+    output = Path(output_s)
+    sg = shutil.which("ast-grep")
+    if not sg:
+        candidate = shutil.which("sg")
+        if candidate:
+            help_proc = run([candidate, "--help"])
+            if "ast-grep" in (help_proc.stdout + help_proc.stderr).lower():
+                sg = candidate
+    if not sg:
+        raise SystemExit("sg or ast-grep is required")
+
+    repo_root = git_value(["rev-parse", "--show-toplevel"], Path.cwd(), str(Path.cwd()))
+    repo_root = repo_root or str(Path.cwd())
+    head = git_value(["rev-parse", "--short", "HEAD"], repo_root, "unborn")
+    branch = git_value(["branch", "--show-current"], repo_root, "unknown") or "main"
+    dirty = bool(git_value(["status", "--porcelain"], repo_root, ""))
+
+    primitives = []
+    counts = {"consoleCalls": 0, "loggerCalls": 0, "loggerBindings": 0}
+    for receiver in ("console", "logger"):
+        for i, match in enumerate(sg_json(sg, f"{receiver}.$METHOD($$$ARGS)", source), start=1):
+            text = text_of(match)
+            rel = file_of(match, source)
+            if not text or not rel:
+                continue
+            method = method_for(text, receiver)
+            primitives.append({
+                "id": f"call:{receiver}:{rel}:{line_of(match)}:{i}",
+                "file": rel,
+                "kind": "call",
+                "line": line_of(match),
+                "text": text,
+                "receiver": receiver,
+                "method": method,
+            })
+            if receiver == "console" and rel == "src/app.ts":
+                counts["consoleCalls"] += 1
+            elif receiver == "logger":
+                counts["loggerCalls"] += 1
+
+    bindings = binding_primitives(source)
+    primitives.extend(bindings)
+    counts["loggerBindings"] = len(bindings)
+
+    payload = {
+        "facts": {
+            "phase": phase,
+            "repo": {
+                "root": repo_root,
+                "head": head,
+                "branch": branch,
+                "dirty": dirty,
+            },
+            "primitives": sorted(primitives, key=lambda p: (p["file"], p["line"], p["id"])),
+            "counts": counts,
+            "hasLoggerBinding": counts["loggerBindings"] > 0,
+        }
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

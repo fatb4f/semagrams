@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:-good}"
+
+mkdir -p patchplan/out/graph patchplan/out/candidate patchplan/out/reports
+
+cue vet patchplan/cue/schema.cue patchplan/out/live/cst.json
+cue vet patchplan/cue/schema.cue patchplan/out/candidate/cst.json
+cue vet patchplan/cue/schema.cue patchplan/out/candidate/compiler.json
+cue vet patchplan/cue/schema.cue patchplan/out/candidate/lsp.json
+cue vet patchplan/cue/schema.cue patchplan/out/candidate/vcs.json
+
+cue export \
+  patchplan/cue/schema.cue \
+  patchplan/cue/change.cue \
+  patchplan/cue/derive.cue \
+  patchplan/out/live/cst.json \
+  patchplan/out/candidate/lsp.json \
+  -e graph \
+  --out json \
+  > patchplan/out/graph/graph.json
+
+cue export \
+  patchplan/cue/schema.cue \
+  patchplan/cue/change.cue \
+  patchplan/cue/derive.cue \
+  patchplan/out/live/cst.json \
+  -e candidateModel \
+  --out json \
+  > patchplan/out/candidate/model.json
+
+cue export \
+  patchplan/cue/schema.cue \
+  patchplan/cue/change.cue \
+  patchplan/cue/derive.cue \
+  patchplan/out/live/cst.json \
+  -e patchPlan \
+  --out json \
+  > patchplan/out/graph/patch-layers.json
+
+cue vet -d '#PatchPlan' patchplan/cue/schema.cue patchplan/out/graph/patch-layers.json
+
+patchplan/scripts/graph-dot patchplan/out/graph/graph.json patchplan/out/graph/deps.dot
+
+python3 - "$mode" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+mode = sys.argv[1]
+live = json.loads(Path("patchplan/out/live/cst.json").read_text())["facts"]
+candidate = json.loads(Path("patchplan/out/candidate/cst.json").read_text())["facts"]
+compiler = json.loads(Path("patchplan/out/candidate/compiler.json").read_text())["compiler"]
+lsp = json.loads(Path("patchplan/out/candidate/lsp.json").read_text())["lsp"]
+vcs = json.loads(Path("patchplan/out/candidate/vcs.json").read_text())["vcs"]
+
+report = {
+    "report": {
+        "changeID": "replace-console-with-logger",
+        "live": {
+            "consoleCallCount": live["counts"]["consoleCalls"],
+        },
+        "candidate": {
+            "consoleCallCount": candidate["counts"]["consoleCalls"],
+            "loggerCallCount": candidate["counts"]["loggerCalls"],
+            "hasLoggerBinding": candidate["hasLoggerBinding"],
+            "compilerErrorCount": compiler["errorCount"],
+            "lspAdapterOK": lsp["adapterOK"],
+            "lspErrorCount": lsp["errorCount"],
+            "diffNonEmpty": vcs["diffNonEmpty"],
+        },
+    }
+}
+c = report["report"]["candidate"]
+report["report"]["accepted"] = (
+    c["consoleCallCount"] == 0
+    and c["loggerCallCount"] >= 1
+    and c["hasLoggerBinding"]
+    and c["compilerErrorCount"] == 0
+    and c["lspAdapterOK"]
+    and c["lspErrorCount"] == 0
+    and c["diffNonEmpty"]
+)
+Path("patchplan/out/reports").mkdir(parents=True, exist_ok=True)
+Path("patchplan/out/reports/report.json").write_text(json.dumps(report, indent=2) + "\n")
+print(f"accepted: {str(report['report']['accepted']).lower()}")
+PY
+
+if cue vet patchplan/cue/schema.cue patchplan/cue/accept.cue patchplan/out/reports/report.json; then
+  printf 'cue acceptance check: pass\n'
+  exit 0
+else
+  printf 'cue acceptance check: fail\n'
+  if [ "$mode" = "bad" ]; then
+    exit 0
+  fi
+  exit 1
+fi

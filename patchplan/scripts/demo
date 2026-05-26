@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:-good}"
+if [ "$mode" != "good" ] && [ "$mode" != "bad" ]; then
+  printf 'usage: patchplan/scripts/demo [good|bad]\n' >&2
+  exit 2
+fi
+
+patchplan/scripts/check-deps
+
+if [ ! -d .patchplan-git ]; then
+  git --git-dir=.patchplan-git --work-tree=. init >/dev/null
+fi
+
+rm -rf patchplan/out
+mkdir -p patchplan/out/live/source patchplan/out/candidate patchplan/out/graph patchplan/out/reports
+cp package.json tsconfig.json patchplan/out/live/source/
+mkdir -p patchplan/out/live/source/src
+cp -R src/. patchplan/out/live/source/src/
+
+patchplan/scripts/extract-cst-facts live patchplan/out/live/source patchplan/out/live/cst.json
+cue vet patchplan/cue/schema.cue patchplan/out/live/cst.json
+
+cue export \
+  patchplan/cue/schema.cue \
+  patchplan/cue/change.cue \
+  patchplan/cue/derive.cue \
+  patchplan/out/live/cst.json \
+  -e graph \
+  --out json \
+  > patchplan/out/graph/graph.json
+
+cue export \
+  patchplan/cue/schema.cue \
+  patchplan/cue/change.cue \
+  patchplan/cue/derive.cue \
+  patchplan/out/live/cst.json \
+  -e candidateModel \
+  --out json \
+  > patchplan/out/candidate/model.json
+
+patchplan/scripts/make-candidate "$mode"
+patchplan/scripts/extract-cst-facts candidate patchplan/out/candidate/source patchplan/out/candidate/cst.json
+patchplan/scripts/extract-compiler-facts candidate patchplan/out/candidate/source patchplan/out/candidate/compiler.json
+patchplan/scripts/extract-lsp-facts candidate patchplan/out/candidate/source patchplan/out/candidate/lsp.json
+patchplan/scripts/extract-vcs-facts candidate patchplan/out/live/source patchplan/out/candidate/source patchplan/out/candidate/vcs.json
+patchplan/scripts/validate "$mode"
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+report = json.loads(Path("patchplan/out/reports/report.json").read_text())["report"]
+print("summary:")
+print(f"  accepted: {str(report['accepted']).lower()}")
+print("  graph: patchplan/out/graph/graph.json")
+print("  dot: patchplan/out/graph/deps.dot")
+print("  candidate model: patchplan/out/candidate/model.json")
+print("  report: patchplan/out/reports/report.json")
+PY

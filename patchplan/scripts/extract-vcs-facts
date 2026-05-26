@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+def git_cmd():
+    root = Path.cwd()
+    alt = root / ".patchplan-git"
+    if alt.exists():
+        return ["git", f"--git-dir={alt}", f"--work-tree={root}"]
+    return ["git"]
+
+
+def git_value(args, fallback=""):
+    proc = subprocess.run([*git_cmd(), *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return proc.stdout.strip() if proc.returncode == 0 else fallback
+
+
+def main():
+    if len(sys.argv) != 5 or sys.argv[1] not in ("live", "candidate"):
+        raise SystemExit("usage: extract-vcs-facts live|candidate <live-source> <candidate-source> <output-file>")
+    phase, live_source, candidate_source, output = sys.argv[1:]
+    proc = subprocess.run(["diff", "-ru", live_source, candidate_source], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    diff_text = proc.stdout
+    diff_lines = [line for line in diff_text.splitlines() if line.startswith("Only in ") or line.startswith("+") or line.startswith("-")]
+    payload = {
+        "vcs": {
+            "phase": phase,
+            "head": git_value(["rev-parse", "--short", "HEAD"], "unborn"),
+            "branch": git_value(["branch", "--show-current"], "unknown") or "main",
+            "diffStat": f"{len(diff_lines)} changed diff lines",
+            "diffNonEmpty": bool(diff_text.strip()),
+        }
+    }
+    out = Path(output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

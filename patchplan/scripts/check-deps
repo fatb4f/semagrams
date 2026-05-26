@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+missing=0
+
+need() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'missing required tool: %s\n' "$1" >&2
+    missing=1
+  fi
+}
+
+warn() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'warning: missing recommended tool: %s\n' "$1" >&2
+  fi
+}
+
+need git
+need node
+need npm
+need python3
+need cue
+need typescript-language-server
+
+if command -v ast-grep >/dev/null 2>&1; then
+  ast_grep_cmd=ast-grep
+elif command -v sg >/dev/null 2>&1 && sg --help 2>&1 | grep -qi 'ast-grep'; then
+  ast_grep_cmd=sg
+else
+  printf 'missing required tool: sg or ast-grep\n' >&2
+  missing=1
+  ast_grep_cmd=
+fi
+
+if ! command -v tsc >/dev/null 2>&1 && ! command -v npx >/dev/null 2>&1; then
+  printf 'missing required tool: tsc or npx tsc\n' >&2
+  missing=1
+fi
+
+warn jq
+warn dot
+warn tree-sitter
+
+if [ "$missing" -ne 0 ]; then
+  exit 1
+fi
+
+printf 'ast-grep command: %s\n' "$ast_grep_cmd"

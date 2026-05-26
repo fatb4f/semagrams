@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def main():
+    if len(sys.argv) != 4 or sys.argv[1] not in ("live", "candidate"):
+        raise SystemExit("usage: extract-compiler-facts live|candidate <source-root> <output-file>")
+    phase, source_root, output = sys.argv[1:]
+    source = Path(source_root).resolve()
+    out = Path(output)
+
+    if shutil.which("tsc"):
+        cmd = ["tsc", "--noEmit", "--pretty", "false"]
+    elif shutil.which("npx"):
+        cmd = ["npx", "--no-install", "tsc", "--noEmit", "--pretty", "false"]
+    else:
+        raise SystemExit("tsc or npx is required")
+
+    proc = subprocess.run(cmd, cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    diagnostics = []
+    if proc.returncode != 0:
+        for line in proc.stdout.splitlines():
+            if not line.strip():
+                continue
+            m = re.match(r"(.+?)\((\d+),\d+\):\s+error\s+([A-Z0-9]+):\s+(.*)", line)
+            diagnostics.append({
+                "file": m.group(1) if m else "",
+                "line": int(m.group(2)) if m else 0,
+                "severity": "error",
+                "code": m.group(3) if m else "",
+                "message": m.group(4) if m else line,
+            })
+
+    payload = {
+        "compiler": {
+            "phase": phase,
+            "errorCount": 0 if proc.returncode == 0 else len(diagnostics),
+            "diagnostics": diagnostics,
+        }
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()
