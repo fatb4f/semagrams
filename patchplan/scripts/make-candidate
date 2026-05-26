@@ -14,16 +14,6 @@ rm -rf "$candidate_root"
 mkdir -p "$candidate_root"
 cp -R "$live_root"/. "$candidate_root"/
 
-python3 - "$candidate_root/package.json" <<'PY'
-from pathlib import Path
-import json
-import sys
-path = Path(sys.argv[1])
-data = json.loads(path.read_text())
-data.pop("type", None)
-path.write_text(json.dumps(data, indent=2) + "\n")
-PY
-
 if [ "$mode" = "good" ]; then
   python3 - "$candidate_root/src" <<'PY'
 from pathlib import Path
@@ -39,7 +29,7 @@ for path in sorted(src.rglob("*.ts")):
     rel_logger = Path("logger")
     if path.parent != src:
         rel_logger = Path(*([".."] * len(path.parent.relative_to(src).parts)), "logger")
-    import_line = f'import {{ logger }} from "./{rel_logger.as_posix()}"\n\n'
+    import_line = f'import {{ logger }} from "./{rel_logger.as_posix()}.js"\n\n'
     if 'import { logger } from ' not in text:
         text = import_line + text
     path.write_text(text)

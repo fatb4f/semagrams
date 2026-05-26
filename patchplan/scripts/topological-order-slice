@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-topological-order.$$"
+out="patchplan/out/reports/topological-order"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp" "$out/cases"
+
+write_report() {
+  local tier="$1"
+  local order_json="$2"
+  local accepted="$3"
+  local note="$4"
+  python3 - "$tier" "$order_json" "$accepted" "$note" "$out/$tier.json" "$out/$tier.md" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+tier, order_path, accepted, note, json_path, md_path = sys.argv[1:]
+patch_order = json.loads(Path(order_path).read_text())["patchOrder"]
+edge_violations = [edge for edge in patch_order["edgeChecks"] if not edge["respects"]]
+payload = {
+    "slice": "topological-order",
+    "tier": tier,
+    "accepted": accepted == "true",
+    "note": note,
+    "order": patch_order["order"],
+    "hasCycle": patch_order["hasCycle"],
+    "cycle": patch_order["cycle"],
+    "deterministicLayerIDs": patch_order["deterministicLayerIDs"],
+    "duplicateLayerIDs": patch_order["duplicateLayerIDs"],
+    "orderMatchesDeclared": patch_order["orderMatchesDeclared"],
+    "edgeViolationCount": len(edge_violations),
+    "edgeChecks": patch_order["edgeChecks"],
+}
+Path(json_path).write_text(json.dumps(payload, indent=2) + "\n")
+Path(md_path).write_text("\n".join([
+    "# Topological Order",
+    "",
+    f"- tier: {tier}",
+    f"- accepted: {accepted}",
+    f"- note: {note}",
+    f"- order: {', '.join(patch_order['order'])}",
+    f"- has cycle: {str(patch_order['hasCycle']).lower()}",
+    f"- deterministic layer IDs: {str(patch_order['deterministicLayerIDs']).lower()}",
+    f"- order matches declared: {str(patch_order['orderMatchesDeclared']).lower()}",
+    f"- edge violations: {len(edge_violations)}",
+    "",
+]))
+PY
+}
+
+run_valid_case() {
+  local tier="$1"
+  local plan="$2"
+  local order="$tmp/$tier-order.json"
+  patchplan/scripts/topological-order "$plan" "$order"
+  cue vet patchplan/cue/schema.cue patchplan/cue/topology.cue "$order" >/dev/null
+  write_report "$tier" "$order" true "CUE accepted deterministic topological order"
+}
+
+run_cycle_case() {
+  local plan="$tmp/cycle-plan.json"
+  local order="$tmp/failure-domain-order.json"
+  python3 - "$plan" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = {
+    "patchLayers": [
+        {"id": "A", "title": "A", "order": 1, "obligations": ["a"], "description": "A"},
+        {"id": "B", "title": "B", "order": 2, "obligations": ["b"], "description": "B"},
+        {"id": "C", "title": "C", "order": 3, "obligations": ["c"], "description": "C"},
+    ],
+    "edges": [
+        {"from": "A", "to": "B", "kind": "must-precede"},
+        {"from": "B", "to": "C", "kind": "must-precede"},
+        {"from": "C", "to": "A", "kind": "must-precede"},
+    ],
+}
+Path(sys.argv[1]).write_text(json.dumps(payload, indent=2) + "\n")
+PY
+  patchplan/scripts/topological-order "$plan" "$order"
+  if cue vet patchplan/cue/schema.cue patchplan/cue/topology.cue "$order" >"$out/cases/failure-domain.log" 2>&1; then
+    write_report failure-domain "$order" false "unexpected CUE pass for cyclic graph"
+    return 1
+  fi
+  write_report failure-domain "$order" true "cycle detected and CUE rejected topology facts"
+}
+
+write_synthetic_plan() {
+  local target="$1"
+  local count="$2"
+  python3 - "$target" "$count" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1])
+count = int(sys.argv[2])
+layers = []
+edges = []
+for index in range(1, count + 1):
+    layer_id = f"{index:03d}-synthetic-layer"
+    layers.append({
+        "id": layer_id,
+        "title": f"Synthetic layer {index}",
+        "order": index,
+        "obligations": [f"obligation:synthetic-{index:03d}"],
+        "description": "Synthetic dependency layer.",
+    })
+    if index > 1:
+        edges.append({
+            "from": f"{index - 1:03d}-synthetic-layer",
+            "to": layer_id,
+            "kind": "must-precede",
+        })
+payload = {"patchLayers": layers, "edges": edges}
+target.write_text(json.dumps(payload, indent=2) + "\n")
+PY
+}
+
+patchplan/scripts/demo good tiny >/dev/null 2>&1
+mkdir -p "$out/cases"
+cp patchplan/out/reports/topological-order/report.json "$out/tiny.json"
+cp patchplan/out/reports/topological-order/report.md "$out/tiny.md"
+
+run_cycle_case
+
+write_synthetic_plan "$tmp/medium-plan.json" 7
+run_valid_case medium "$tmp/medium-plan.json"
+
+write_synthetic_plan "$tmp/large-plan.json" 55
+run_valid_case large "$tmp/large-plan.json"
+
+printf 'topological-order reports:\n'
+printf '  patchplan/out/reports/topological-order/failure-domain.json\n'
+printf '  patchplan/out/reports/topological-order/tiny.json\n'
+printf '  patchplan/out/reports/topological-order/medium.json\n'
+printf '  patchplan/out/reports/topological-order/large.json\n'

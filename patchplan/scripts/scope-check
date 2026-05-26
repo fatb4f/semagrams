@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+
+def in_scope(path: str) -> tuple[bool, str]:
+    if path == "src/logger.ts":
+        return True, ""
+    if not path.startswith("src/"):
+        return False, "outside declared src/**/*.ts include scope"
+    if path.startswith("src/vendor/"):
+        return False, "inside excluded vendor subtree"
+    if not path.endswith(".ts"):
+        return False, "not a TypeScript source file"
+    return True, ""
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: patchplan/scripts/scope-check <patch-manifest.json> <scope.json>")
+    manifest = json.loads(Path(sys.argv[1]).read_text())["patchManifest"]
+    paths = sorted({
+        path
+        for patch in manifest["patches"]
+        for path in patch["touchedPaths"]
+    })
+    violations = []
+    for path in paths:
+        ok, reason = in_scope(path)
+        if not ok:
+            violations.append({"path": path, "reason": reason})
+    payload = {
+        "scope": {
+            "checkedPaths": paths,
+            "violations": violations,
+            "ok": not violations,
+        }
+    }
+    out = Path(sys.argv[2])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

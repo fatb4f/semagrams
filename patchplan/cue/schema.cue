@@ -182,6 +182,69 @@ package patchplan
 	edges:       [...#PatchLayerEdge]
 }
 
+#PatchOrderLayer: {
+	id:            string
+	declaredOrder: int & >=1
+	topoIndex:     int & >=1
+}
+
+#PatchOrderEdgeCheck: {
+	from:      string
+	to:        string
+	fromOrder: int & >=1
+	toOrder:   int & >=1
+	respects:  bool
+
+	respects: fromOrder < toOrder
+}
+
+#PatchOrder: {
+	patchLayers: [...#PatchOrderLayer]
+	order:       [...string]
+	edgeChecks:  [...#PatchOrderEdgeCheck]
+
+	hasCycle:              bool
+	cycle:                 [...string]
+	deterministicLayerIDs: bool
+	duplicateLayerIDs:     [...string]
+	orderMatchesDeclared:  bool
+}
+
+#PatchFile: {
+	path:        string
+	layerID:     string
+	obligations: [string, ...string]
+	touchedPaths: [...string]
+	addedLineCount:   int & >=0
+	removedLineCount: int & >=0
+
+	evidence: {
+		hasLoggerExport:  bool
+		hasLoggerRewrite: bool
+	}
+}
+
+#PatchApplyCheck: {
+	ordered: bool
+	ok:      bool
+}
+
+#PatchManifest: {
+	patches: [...#PatchFile]
+	applyCheck: #PatchApplyCheck
+}
+
+#ScopeViolation: {
+	path:   string
+	reason: string
+}
+
+#ScopeFacts: {
+	checkedPaths: [...string]
+	violations:   [...#ScopeViolation]
+	ok:           bool
+}
+
 #Report: {
 	changeID: string
 
@@ -201,6 +264,7 @@ package patchplan
 		allResolveTargetsKnown:      bool
 		noDuplicateSemanticNodeIDs:  bool
 		semanticOrderDeterministic:  bool
+		noScopeViolations:           bool
 	}
 
 	accepted: bool
@@ -215,7 +279,8 @@ package patchplan
 		candidate.allLoggerReferencesResolved &&
 		candidate.allResolveTargetsKnown &&
 		candidate.noDuplicateSemanticNodeIDs &&
-		candidate.semanticOrderDeterministic
+		candidate.semanticOrderDeterministic &&
+		candidate.noScopeViolations
 }
 
 #ReportInput: {
@@ -224,6 +289,7 @@ package patchplan
 	compiler:  #CompilerFacts & {phase: "candidate"}
 	lsp:       #LSPFacts & {phase: "candidate"}
 	vcs:       #VCSFacts & {phase: "candidate"}
+	scope:     #ScopeFacts
 
 	compiler: {
 		errorCount: lsp.errorCount
@@ -237,5 +303,8 @@ vcs?:            #VCSFacts
 graph?:          #Graph
 candidateModel?: #CandidateModel
 patchPlan?:      #PatchPlan
+patchOrder?:     #PatchOrder
+patchManifest?:  #PatchManifest
+scope?:          #ScopeFacts
 report?:         #Report
 reportInput?:    #ReportInput

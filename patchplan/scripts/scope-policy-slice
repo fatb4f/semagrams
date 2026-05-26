@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-scope-policy.$$"
+out="patchplan/out/reports/scope-policy"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp" "$out/cases"
+
+patchplan/scripts/demo good >/dev/null 2>&1
+mkdir -p "$out/cases"
+cp patchplan/out/patches/manifest.json "$tmp/base-manifest.json"
+
+make_case() {
+  local tier="$1"
+  shift
+  python3 - "$tmp/base-manifest.json" "$out/cases/$tier-manifest.json" "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+base = json.loads(Path(sys.argv[1]).read_text())
+target = Path(sys.argv[2])
+extra_paths = sys.argv[3:]
+patches = base["patchManifest"]["patches"]
+patches[-1]["touchedPaths"] = sorted(set(patches[-1]["touchedPaths"] + extra_paths))
+target.write_text(json.dumps(base, indent=2) + "\n")
+PY
+  patchplan/scripts/scope-check "$out/cases/$tier-manifest.json" "$out/cases/$tier-scope.json"
+  if cue vet patchplan/cue/schema.cue patchplan/cue/scope-policy.cue "$out/cases/$tier-scope.json" >"$out/cases/$tier.log" 2>&1; then
+    rejected=false
+  else
+    rejected=true
+  fi
+  python3 - "$tier" "$rejected" "$out/cases/$tier-scope.json" "$out/$tier.json" "$out/$tier.md" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+tier, rejected, scope_path, json_path, md_path = sys.argv[1:]
+scope = json.loads(Path(scope_path).read_text())["scope"]
+violation_nodes = [
+    {
+        "id": f"scope-violation:{violation['path']}",
+        "kind": "scope-violation",
+        "label": f"{violation['path']}: {violation['reason']}",
+    }
+    for violation in scope["violations"]
+]
+violation_edges = [
+    {
+        "from": node["id"],
+        "to": "obligation:rewrite-console-calls",
+        "kind": "conflicts",
+        "label": "out-of-scope touch",
+    }
+    for node in violation_nodes
+]
+payload = {
+    "slice": "scope-policy",
+    "tier": tier,
+    "accepted": rejected == "true",
+    "scopeAccepted": scope["ok"],
+    "cueRejected": rejected == "true",
+    "checkedPaths": scope["checkedPaths"],
+    "violations": scope["violations"],
+    "violationCount": len(scope["violations"]),
+    "graph": {
+        "nodes": violation_nodes,
+        "edges": violation_edges,
+    },
+    "graphHasViolation": bool(violation_nodes and violation_edges),
+}
+Path(json_path).write_text(json.dumps(payload, indent=2) + "\n")
+Path(md_path).write_text("\n".join([
+    "# Scope Policy",
+    "",
+    f"- tier: {tier}",
+    f"- accepted: {str(payload['accepted']).lower()}",
+    f"- CUE rejected: {str(payload['cueRejected']).lower()}",
+    f"- violations: {payload['violationCount']}",
+    f"- graph has violation: {str(payload['graphHasViolation']).lower()}",
+    "",
+]))
+PY
+}
+
+make_case failure-domain README.md package.json src/vendor/logger.ts
+make_case tiny README.md
+make_case medium README.md package.json src/vendor/logger.ts
+make_case large src/generated/case-001.ts src/generated/case-002.ts src/generated/case-003.ts src/vendor/escape.ts
+
+printf 'scope-policy reports:\n'
+printf '  patchplan/out/reports/scope-policy/failure-domain.json\n'
+printf '  patchplan/out/reports/scope-policy/tiny.json\n'
+printf '  patchplan/out/reports/scope-policy/medium.json\n'
+printf '  patchplan/out/reports/scope-policy/large.json\n'

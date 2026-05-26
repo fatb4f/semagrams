@@ -19,6 +19,7 @@ derivedReport: #Report & {
 		allResolveTargetsKnown:      reportInput.lsp.semanticSummary.allResolveTargetsKnown
 		noDuplicateSemanticNodeIDs:  len(reportInput.lsp.semanticSummary.duplicateNodeIDs) == 0
 		semanticOrderDeterministic:  reportInput.lsp.semanticSummary.deterministicOrder
+		noScopeViolations:           reportInput.scope.ok
 	}
 }
 

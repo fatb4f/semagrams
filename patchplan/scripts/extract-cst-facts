@@ -73,7 +73,7 @@ def method_for(text, receiver):
 
 def binding_primitives(source):
     patterns = [
-        re.compile(r'import\s*\{\s*logger\s*\}\s*from\s*["\']\.\/logger["\']'),
+        re.compile(r'import\s*\{\s*logger\s*\}\s*from\s*["\'][^"\']*logger(?:\.js)?["\']'),
         re.compile(r'export\s+const\s+logger\s*='),
         re.compile(r'(?<!export\s)const\s+logger\s*='),
     ]
@@ -118,17 +118,20 @@ def main():
     primitives = []
     counts = {"consoleCalls": 0, "loggerCalls": 0, "loggerBindings": 0}
     for receiver in ("console", "logger"):
-        for i, match in enumerate(sg_json(sg, f"{receiver}.$METHOD($$$ARGS)", source), start=1):
+        normalized_matches = []
+        for match in sg_json(sg, f"{receiver}.$METHOD($$$ARGS)", source):
             text = text_of(match)
             rel = file_of(match, source)
             if not text or not rel:
                 continue
             method = method_for(text, receiver)
+            normalized_matches.append((rel, line_of(match), method, text))
+        for i, (rel, line, method, text) in enumerate(sorted(normalized_matches), start=1):
             primitives.append({
-                "id": f"call:{receiver}:{rel}:{line_of(match)}:{i}",
+                "id": f"call:{receiver}:{rel}:{line}:{i}",
                 "file": rel,
                 "kind": "call",
-                "line": line_of(match),
+                "line": line,
                 "text": text,
                 "receiver": receiver,
                 "method": method,

@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-patch-emission.$$"
+out="patchplan/out/reports/patch-emission"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp/reports" "$tmp/medium/src" "$tmp/large/src/generated"
+
+copy_project_files() {
+  local root="$1"
+  cp package.json tsconfig.json "$root"/
+}
+
+write_medium_fixture() {
+  copy_project_files "$tmp/medium"
+  cat > "$tmp/medium/src/app.ts" <<'TS'
+export function run(user: { id: string }) {
+  console.log(user.id)
+}
+TS
+  cat > "$tmp/medium/src/worker.ts" <<'TS'
+export function work(user: { id: string }) {
+  console.error("worker", user.id)
+}
+TS
+  cat > "$tmp/medium/src/service.ts" <<'TS'
+export function serve(user: { id: string }) {
+  console.log("service", user.id)
+}
+TS
+}
+
+write_large_fixture() {
+  copy_project_files "$tmp/large"
+  cat > "$tmp/large/src/app.ts" <<'TS'
+export function run(user: { id: string }) {
+  console.log(user.id)
+}
+TS
+  for i in $(seq -w 1 50); do
+    cat > "$tmp/large/src/generated/case-$i.ts" <<TS
+export function case$i(user: { id: string }) {
+  console.log("case-$i", user.id)
+}
+TS
+  done
+}
+
+stash_report() {
+  local tier="$1"
+  cp patchplan/out/reports/patch-emission/report.json "$tmp/reports/$tier.json"
+  cp patchplan/out/reports/patch-emission/report.md "$tmp/reports/$tier.md"
+}
+
+write_failure_domain() {
+  mkdir -p "$out/cases"
+  python3 - "$out/cases/claims-obligation-without-implementation.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source = json.loads(Path("patchplan/out/reports/patch-emission/input.json").read_text())
+for patch in source["patchManifest"]["patches"]:
+    if patch["layerID"] == "001-provide-logger-binding":
+        patch["touchedPaths"] = ["src/not-logger.ts"]
+        patch["addedLineCount"] = 0
+        patch["evidence"]["hasLoggerExport"] = False
+Path(sys.argv[1]).write_text(json.dumps(source, indent=2) + "\n")
+PY
+  if cue vet patchplan/cue/schema.cue patchplan/cue/patch-emission.cue "$out/cases/claims-obligation-without-implementation.json" >"$out/cases/claims-obligation-without-implementation.log" 2>&1; then
+    status="unexpected-pass"
+    accepted=false
+  else
+    status="rejected"
+    accepted=true
+  fi
+  python3 - "$status" "$accepted" "$out/failure-domain.json" "$out/failure-domain.md" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+status, accepted, json_path, md_path = sys.argv[1:]
+payload = {
+    "slice": "patch-emission",
+    "tier": "failure-domain",
+    "accepted": accepted == "true",
+    "case": "claims-obligation-without-implementation",
+    "status": status,
+}
+Path(json_path).write_text(json.dumps(payload, indent=2) + "\n")
+Path(md_path).write_text("\n".join([
+    "# Patch Emission",
+    "",
+    "- tier: failure-domain",
+    f"- accepted: {accepted}",
+    f"- claims-obligation-without-implementation: {status}",
+    "",
+]))
+PY
+  if [ "$accepted" != "true" ]; then
+    return 1
+  fi
+  cp "$out/failure-domain.json" "$tmp/reports/failure-domain.json"
+  cp "$out/failure-domain.md" "$tmp/reports/failure-domain.md"
+}
+
+write_medium_fixture
+write_large_fixture
+
+patchplan/scripts/demo good tiny >/dev/null 2>&1
+stash_report tiny
+write_failure_domain
+
+PATCHPLAN_LIVE_SOURCE_ROOT="$tmp/medium" patchplan/scripts/demo good medium >/dev/null 2>&1
+stash_report medium
+
+PATCHPLAN_LIVE_SOURCE_ROOT="$tmp/large" patchplan/scripts/demo good large >/dev/null 2>&1
+stash_report large
+
+mkdir -p "$out"
+cp "$tmp/reports"/* "$out"/
+
+printf 'patch-emission reports:\n'
+printf '  patchplan/out/reports/patch-emission/failure-domain.json\n'
+printf '  patchplan/out/reports/patch-emission/tiny.json\n'
+printf '  patchplan/out/reports/patch-emission/medium.json\n'
+printf '  patchplan/out/reports/patch-emission/large.json\n'

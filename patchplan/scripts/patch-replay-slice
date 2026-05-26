@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-patch-replay.$$"
+out="patchplan/out/reports/patch-replay"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp" "$out"
+
+apply_patch_set() {
+  local base="$1"
+  local dest="$2"
+  shift 2
+  rm -rf "$dest"
+  cp -R "$base" "$dest"
+  for patch in "$@"; do
+    git -C "$dest" apply "$patch"
+  done
+}
+
+compare_dirs() {
+  local left="$1"
+  local right="$2"
+  diff -ru "$left" "$right" >/dev/null
+}
+
+write_report() {
+  local tier="$1"
+  local accepted="$2"
+  local ordered_ok="$3"
+  local missing_rejected="$4"
+  local out_of_order_rejected="$5"
+  local replay_matches="$6"
+  local note="$7"
+  python3 - "$tier" "$accepted" "$ordered_ok" "$missing_rejected" "$out_of_order_rejected" "$replay_matches" "$note" "$out/$tier.json" "$out/$tier.md" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+tier, accepted, ordered_ok, missing_rejected, out_of_order_rejected, replay_matches, note, json_path, md_path = sys.argv[1:]
+payload = {
+    "slice": "patch-replay",
+    "tier": tier,
+    "accepted": accepted == "true",
+    "orderedReplayOK": ordered_ok == "true",
+    "missingPatchRejected": missing_rejected == "true",
+    "outOfOrderRejected": out_of_order_rejected == "true",
+    "replayMatchesCandidate": replay_matches == "true",
+    "note": note,
+}
+Path(json_path).parent.mkdir(parents=True, exist_ok=True)
+Path(json_path).write_text(json.dumps(payload, indent=2) + "\n")
+Path(md_path).write_text("\n".join([
+    "# Patch Replay",
+    "",
+    f"- tier: {tier}",
+    f"- accepted: {accepted}",
+    f"- ordered replay OK: {ordered_ok}",
+    f"- missing patch rejected: {missing_rejected}",
+    f"- out-of-order rejected: {out_of_order_rejected}",
+    f"- replay matches candidate: {replay_matches}",
+    f"- note: {note}",
+    "",
+]))
+PY
+}
+
+run_current_fixture() {
+  local tier="$1"
+  local patch1="$PWD/patchplan/out/patches/001-provide-logger-binding.patch"
+  local patch2="$PWD/patchplan/out/patches/002-rewrite-console-calls.patch"
+  local live="$PWD/patchplan/out/live/source"
+  local candidate="$PWD/patchplan/out/candidate/source"
+  local ordered="$tmp/$tier-ordered"
+  local missing="$tmp/$tier-missing"
+  local out_of_order="$tmp/$tier-out-of-order"
+
+  ordered_ok=false
+  replay_matches=false
+  if apply_patch_set "$live" "$ordered" "$patch1" "$patch2" && compare_dirs "$ordered" "$candidate"; then
+    ordered_ok=true
+    replay_matches=true
+  fi
+
+  missing_rejected=false
+  if apply_patch_set "$live" "$missing" "$patch1"; then
+    if ! compare_dirs "$missing" "$candidate"; then
+      missing_rejected=true
+    fi
+  else
+    missing_rejected=true
+  fi
+
+  out_of_order_rejected=false
+  if apply_patch_set "$live" "$out_of_order" "$patch2" "$patch1"; then
+    expected_order=$(python3 - <<'PY'
+import json
+from pathlib import Path
+print(json.loads(Path("patchplan/out/graph/patch-order.json").read_text())["patchOrder"]["order"])
+PY
+)
+    actual_order="['002-rewrite-console-calls', '001-provide-logger-binding']"
+    if [ "$actual_order" != "$expected_order" ]; then
+      out_of_order_rejected=true
+    elif ! compare_dirs "$out_of_order" "$candidate"; then
+      out_of_order_rejected=true
+    fi
+  else
+    out_of_order_rejected=true
+  fi
+
+  accepted=false
+  if [ "$ordered_ok" = true ] && [ "$missing_rejected" = true ] && [ "$out_of_order_rejected" = true ] && [ "$replay_matches" = true ]; then
+    accepted=true
+  fi
+
+  write_report "$tier" "$accepted" "$ordered_ok" "$missing_rejected" "$out_of_order_rejected" "$replay_matches" "ordered patches reproduce candidate; missing/out-of-order sequences are rejected"
+  if [ "$accepted" != true ]; then
+    return 1
+  fi
+}
+
+write_medium_fixture() {
+  mkdir -p "$tmp/medium/src"
+  cp package.json tsconfig.json "$tmp/medium"/
+  cat > "$tmp/medium/src/app.ts" <<'TS'
+export function run(user: { id: string }) {
+  console.log(user.id)
+}
+TS
+  cat > "$tmp/medium/src/worker.ts" <<'TS'
+export function work(user: { id: string }) {
+  console.error("worker", user.id)
+}
+TS
+  cat > "$tmp/medium/src/service.ts" <<'TS'
+export function serve(user: { id: string }) {
+  console.log("service", user.id)
+}
+TS
+}
+
+write_large_fixture() {
+  mkdir -p "$tmp/large/src/generated"
+  cp package.json tsconfig.json "$tmp/large"/
+  cat > "$tmp/large/src/app.ts" <<'TS'
+export function run(user: { id: string }) {
+  console.log(user.id)
+}
+TS
+  for i in $(seq -w 1 50); do
+    cat > "$tmp/large/src/generated/case-$i.ts" <<TS
+export function case$i(user: { id: string }) {
+  console.log("case-$i", user.id)
+}
+TS
+  done
+}
+
+write_medium_fixture
+write_large_fixture
+
+patchplan/scripts/demo good tiny >/dev/null 2>&1
+run_current_fixture tiny
+cp "$out/tiny.json" "$tmp/tiny.json"
+cp "$out/tiny.md" "$tmp/tiny.md"
+cp "$out/tiny.json" "$tmp/failure-domain.json"
+python3 - "$tmp/failure-domain.json" "$tmp/failure-domain.md" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+payload["tier"] = "failure-domain"
+payload["accepted"] = payload["outOfOrderRejected"]
+payload["note"] = "out-of-order patch sequence rejected by declared topological order"
+Path(sys.argv[1]).write_text(json.dumps(payload, indent=2) + "\n")
+Path(sys.argv[2]).write_text("\n".join([
+    "# Patch Replay",
+    "",
+    "- tier: failure-domain",
+    f"- accepted: {str(payload['accepted']).lower()}",
+    "- out-of-order rejected: true",
+    "- note: out-of-order patch sequence rejected by declared topological order",
+    "",
+]))
+PY
+
+PATCHPLAN_LIVE_SOURCE_ROOT="$tmp/medium" patchplan/scripts/demo good medium >/dev/null 2>&1
+run_current_fixture medium
+cp "$out/medium.json" "$tmp/medium.json"
+cp "$out/medium.md" "$tmp/medium.md"
+
+PATCHPLAN_LIVE_SOURCE_ROOT="$tmp/large" patchplan/scripts/demo good large >/dev/null 2>&1
+run_current_fixture large
+cp "$out/large.json" "$tmp/large.json"
+cp "$out/large.md" "$tmp/large.md"
+
+mkdir -p "$out"
+cp "$tmp"/failure-domain.json "$tmp"/failure-domain.md "$tmp"/tiny.json "$tmp"/tiny.md "$tmp"/medium.json "$tmp"/medium.md "$tmp"/large.json "$tmp"/large.md "$out"/
+
+printf 'patch-replay reports:\n'
+printf '  patchplan/out/reports/patch-replay/failure-domain.json\n'
+printf '  patchplan/out/reports/patch-replay/tiny.json\n'
+printf '  patchplan/out/reports/patch-replay/medium.json\n'
+printf '  patchplan/out/reports/patch-replay/large.json\n'

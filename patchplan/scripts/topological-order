@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+import heapq
+import json
+import sys
+from pathlib import Path
+
+
+def fail_usage() -> None:
+    print("usage: patchplan/scripts/topological-order <patch-layers.json> <patch-order.json>", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def first_cycle(nodes: list[str], edges: list[tuple[str, str]]) -> list[str]:
+    graph = {node: [] for node in nodes}
+    for src, dst in edges:
+        graph.setdefault(src, []).append(dst)
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    stack: list[str] = []
+
+    def visit(node: str) -> list[str] | None:
+        visiting.add(node)
+        stack.append(node)
+        for nxt in sorted(graph.get(node, [])):
+            if nxt in visiting:
+                start = stack.index(nxt)
+                return stack[start:] + [nxt]
+            if nxt not in visited:
+                found = visit(nxt)
+                if found:
+                    return found
+        stack.pop()
+        visiting.remove(node)
+        visited.add(node)
+        return None
+
+    for node in sorted(nodes):
+        if node not in visited:
+            found = visit(node)
+            if found:
+                return found
+    return []
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        fail_usage()
+
+    source = Path(sys.argv[1])
+    target = Path(sys.argv[2])
+    payload = json.loads(source.read_text())
+    layers = payload.get("patchLayers", [])
+    edges_payload = payload.get("edges", [])
+
+    ids = [layer["id"] for layer in layers]
+    duplicates = sorted({layer_id for layer_id in ids if ids.count(layer_id) > 1})
+    deterministic_layer_ids = ids == sorted(ids)
+
+    order_by_id = {layer["id"]: int(layer["order"]) for layer in layers}
+    node_ids = sorted(set(ids))
+    edges = [(edge["from"], edge["to"]) for edge in edges_payload]
+
+    indegree = {node: 0 for node in node_ids}
+    adjacency = {node: [] for node in node_ids}
+    for src, dst in edges:
+        adjacency.setdefault(src, []).append(dst)
+        indegree.setdefault(src, 0)
+        indegree[dst] = indegree.get(dst, 0) + 1
+
+    ready = [node for node, degree in indegree.items() if degree == 0]
+    heapq.heapify(ready)
+    topo_order: list[str] = []
+    while ready:
+        node = heapq.heappop(ready)
+        topo_order.append(node)
+        for nxt in sorted(adjacency.get(node, [])):
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                heapq.heappush(ready, nxt)
+
+    has_cycle = len(topo_order) != len(indegree)
+    cycle = first_cycle(node_ids, edges) if has_cycle else []
+    topo_index = {layer_id: index for index, layer_id in enumerate(topo_order, start=1)}
+    declared_order_ids = [
+        layer["id"]
+        for layer in sorted(layers, key=lambda layer: (int(layer["order"]), layer["id"]))
+    ]
+
+    edge_checks = []
+    for src, dst in sorted(edges):
+        from_order = order_by_id.get(src, 0)
+        to_order = order_by_id.get(dst, 0)
+        edge_checks.append({
+            "from": src,
+            "to": dst,
+            "fromOrder": from_order,
+            "toOrder": to_order,
+            "respects": from_order < to_order,
+        })
+
+    patch_order = {
+        "patchOrder": {
+            "patchLayers": [
+                {
+                    "id": layer["id"],
+                    "declaredOrder": int(layer["order"]),
+                    "topoIndex": topo_index.get(layer["id"], 1),
+                }
+                for layer in sorted(layers, key=lambda layer: layer["id"])
+            ],
+            "order": topo_order,
+            "edgeChecks": edge_checks,
+            "hasCycle": has_cycle,
+            "cycle": cycle,
+            "deterministicLayerIDs": deterministic_layer_ids,
+            "duplicateLayerIDs": duplicates,
+            "orderMatchesDeclared": topo_order == declared_order_ids,
+        }
+    }
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(patch_order, indent=2) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

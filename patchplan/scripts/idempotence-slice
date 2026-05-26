@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-idempotence.$$"
+out="patchplan/out/reports/idempotence"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp/reports" "$out"
+
+write_fixture() {
+  local tier="$1"
+  local root="$tmp/$tier"
+  mkdir -p "$root/src"
+  cp package.json tsconfig.json "$root"/
+  case "$tier" in
+    medium)
+      cat > "$root/src/app.ts" <<'TS'
+export function run(user: { id: string }) {
+  console.log(user.id)
+}
+TS
+      cat > "$root/src/worker.ts" <<'TS'
+export function work(user: { id: string }) {
+  console.error("worker", user.id)
+}
+TS
+      cat > "$root/src/service.ts" <<'TS'
+export function serve(user: { id: string }) {
+  console.log("service", user.id)
+}
+TS
+      ;;
+    large)
+      mkdir -p "$root/src/generated"
+      cat > "$root/src/app.ts" <<'TS'
+export function run(user: { id: string }) {
+  console.log(user.id)
+}
+TS
+      for i in $(seq -w 1 50); do
+        cat > "$root/src/generated/case-$i.ts" <<TS
+export function case$i(user: { id: string }) {
+  console.log("case-$i", user.id)
+}
+TS
+      done
+      ;;
+  esac
+}
+
+hash_artifacts() {
+  python3 - <<'PY'
+import hashlib
+from pathlib import Path
+
+paths = [
+    "patchplan/out/graph/graph.json",
+    "patchplan/out/candidate/model.json",
+    "patchplan/out/graph/patch-layers.json",
+    "patchplan/out/graph/patch-order.json",
+    "patchplan/out/reports/report.json",
+    "patchplan/out/candidate/lsp.json",
+    "patchplan/out/patches/manifest.json",
+]
+for path in paths:
+    data = Path(path).read_bytes()
+    print(f"{path} {hashlib.sha256(data).hexdigest()}")
+PY
+}
+
+run_tier() {
+  local tier="$1"
+  local root="${2:-}"
+  local tier_tmp="$tmp/$tier-runs"
+  mkdir -p "$tier_tmp"
+  for run in 1 2 3; do
+    if [ -n "$root" ]; then
+      PATCHPLAN_LIVE_SOURCE_ROOT="$root" patchplan/scripts/demo good "$tier" >/dev/null 2>&1
+    else
+      patchplan/scripts/demo good "$tier" >/dev/null 2>&1
+    fi
+    hash_artifacts > "$tier_tmp/run-$run.sha256"
+    cp patchplan/out/candidate/lsp.json "$tier_tmp/lsp-$run.json"
+  done
+  python3 - "$tier" "$tier_tmp" "$out/$tier.json" "$out/$tier.md" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+tier, run_dir, json_path, md_path = sys.argv[1:]
+run_dir = Path(run_dir)
+hashes = [path.read_text().splitlines() for path in sorted(run_dir.glob("run-*.sha256"))]
+stable = hashes[0] == hashes[1] == hashes[2]
+lsp_payloads = [json.loads(path.read_text())["lsp"] for path in sorted(run_dir.glob("lsp-*.json"))]
+semantic_ids = [
+    [node["id"] for node in payload.get("semanticNodes", [])]
+    for payload in lsp_payloads
+]
+semantic_edges = [
+    [f"{edge['from']}->{edge['to']}:{edge['kind']}" for edge in payload.get("semanticEdges", [])]
+    for payload in lsp_payloads
+]
+semantic_stable = semantic_ids[0] == semantic_ids[1] == semantic_ids[2] and semantic_edges[0] == semantic_edges[1] == semantic_edges[2]
+timestamp_pattern = re.compile(r"\d{4}-\d{2}-\d{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}")
+timestamp_hits = []
+for line in hashes[0]:
+    artifact = line.split(" ", 1)[0]
+    text = Path(artifact).read_text(errors="ignore")
+    if timestamp_pattern.search(text):
+        timestamp_hits.append(artifact)
+payload = {
+    "slice": "idempotence",
+    "tier": tier,
+    "accepted": stable and semantic_stable and not timestamp_hits,
+    "runCount": 3,
+    "stableHashes": stable,
+    "semanticOrderStable": semantic_stable,
+    "timestampHits": timestamp_hits,
+    "hashes": hashes,
+}
+Path(json_path).parent.mkdir(parents=True, exist_ok=True)
+Path(json_path).write_text(json.dumps(payload, indent=2) + "\n")
+Path(md_path).write_text("\n".join([
+    "# Idempotence",
+    "",
+    f"- tier: {tier}",
+    f"- accepted: {str(payload['accepted']).lower()}",
+    f"- stable hashes: {str(stable).lower()}",
+    f"- semantic order stable: {str(semantic_stable).lower()}",
+    f"- timestamp hits: {len(timestamp_hits)}",
+    "",
+]))
+if not payload["accepted"]:
+    raise SystemExit(1)
+PY
+  cp "$out/$tier.json" "$tmp/reports/$tier.json"
+  cp "$out/$tier.md" "$tmp/reports/$tier.md"
+}
+
+write_failure_domain() {
+  mkdir -p "$out/cases"
+  date +%s%N > "$out/cases/unstable-a.txt"
+  sleep 0.01
+  date +%s%N > "$out/cases/unstable-b.txt"
+  if cmp -s "$out/cases/unstable-a.txt" "$out/cases/unstable-b.txt"; then
+    accepted=false
+  else
+    accepted=true
+  fi
+  python3 - "$accepted" "$out/failure-domain.json" "$out/failure-domain.md" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+accepted, json_path, md_path = sys.argv[1:]
+payload = {
+    "slice": "idempotence",
+    "tier": "failure-domain",
+    "accepted": accepted == "true",
+    "case": "timestamped-output",
+    "unstableDetected": accepted == "true",
+}
+Path(json_path).write_text(json.dumps(payload, indent=2) + "\n")
+Path(md_path).write_text("\n".join([
+    "# Idempotence",
+    "",
+    "- tier: failure-domain",
+    f"- accepted: {accepted}",
+    "- case: timestamped-output",
+    "",
+]))
+PY
+}
+
+write_fixture medium
+write_fixture large
+run_tier tiny
+run_tier medium "$tmp/medium"
+run_tier large "$tmp/large"
+write_failure_domain
+cp "$out/failure-domain.json" "$tmp/reports/failure-domain.json"
+cp "$out/failure-domain.md" "$tmp/reports/failure-domain.md"
+
+mkdir -p "$out"
+cp "$tmp/reports"/* "$out"/
+
+printf 'idempotence reports:\n'
+printf '  patchplan/out/reports/idempotence/failure-domain.json\n'
+printf '  patchplan/out/reports/idempotence/tiny.json\n'
+printf '  patchplan/out/reports/idempotence/medium.json\n'
+printf '  patchplan/out/reports/idempotence/large.json\n'

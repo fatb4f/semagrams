@@ -5,8 +5,12 @@ mode="${1:-good}"
 tier="${2:-report}"
 
 mkdir -p patchplan/out/graph patchplan/out/candidate patchplan/out/reports
+mkdir -p patchplan/out/patches
 mkdir -p patchplan/out/reports/ordered-symbols
 mkdir -p patchplan/out/reports/graph-consistency
+mkdir -p patchplan/out/reports/topological-order
+mkdir -p patchplan/out/reports/patch-emission
+mkdir -p patchplan/out/reports/scope-policy
 
 cue vet patchplan/cue/schema.cue patchplan/out/live/cst.json
 cue vet patchplan/cue/schema.cue patchplan/out/candidate/cst.json
@@ -44,6 +48,69 @@ cue export \
 
 cue vet -d '#PatchPlan' patchplan/cue/schema.cue patchplan/out/graph/patch-layers.json
 cue vet patchplan/cue/schema.cue patchplan/cue/patch-integrity.cue patchplan/out/graph/patch-layers.json
+patchplan/scripts/topological-order patchplan/out/graph/patch-layers.json patchplan/out/graph/patch-order.json
+cue vet patchplan/cue/schema.cue patchplan/cue/topology.cue patchplan/out/graph/patch-order.json
+patchplan/scripts/emit-patches \
+  patchplan/out/live/source \
+  patchplan/out/candidate/source \
+  patchplan/out/graph/patch-layers.json \
+  patchplan/out/patches \
+  patchplan/out/patches/manifest.json
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+plan = json.loads(Path("patchplan/out/graph/patch-layers.json").read_text())
+manifest = json.loads(Path("patchplan/out/patches/manifest.json").read_text())
+payload = {
+    "patchLayers": plan["patchLayers"],
+    "edges": plan["edges"],
+    "patchManifest": manifest["patchManifest"],
+}
+Path("patchplan/out/reports/patch-emission/input.json").write_text(json.dumps(payload, indent=2) + "\n")
+PY
+if cue vet patchplan/cue/schema.cue patchplan/cue/patch-emission.cue patchplan/out/reports/patch-emission/input.json; then
+  patch_emission_ok=true
+else
+  patch_emission_ok=false
+  if [ "$mode" != "bad" ]; then
+    exit 1
+  fi
+fi
+patchplan/scripts/scope-check patchplan/out/patches/manifest.json patchplan/out/reports/scope-policy/scope.json
+if cue vet patchplan/cue/schema.cue patchplan/cue/scope-policy.cue patchplan/out/reports/scope-policy/scope.json; then
+  scope_policy_ok=true
+else
+  scope_policy_ok=false
+  if [ "$mode" != "bad" ]; then
+    exit 1
+  fi
+fi
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+graph_path = Path("patchplan/out/graph/graph.json")
+scope = json.loads(Path("patchplan/out/reports/scope-policy/scope.json").read_text())["scope"]
+graph = json.loads(graph_path.read_text())
+for violation in scope["violations"]:
+    node_id = f"scope-violation:{violation['path']}"
+    graph.setdefault("nodes", []).append({
+        "id": node_id,
+        "kind": "scope-violation",
+        "label": f"{violation['path']}: {violation['reason']}",
+    })
+    graph.setdefault("edges", []).append({
+        "from": node_id,
+        "to": "obligation:rewrite-console-calls",
+        "kind": "conflicts",
+        "label": "out-of-scope touch",
+    })
+graph["nodes"] = sorted(graph.get("nodes", []), key=lambda node: (node.get("id", ""), node.get("kind", ""), node.get("label", "")))
+graph["edges"] = sorted(graph.get("edges", []), key=lambda edge: (edge.get("from", ""), edge.get("to", ""), edge.get("kind", ""), edge.get("label", "")))
+graph_path.write_text(json.dumps(graph, indent=2, sort_keys=True) + "\n")
+PY
 
 patchplan/scripts/graph-dot patchplan/out/graph/graph.json patchplan/out/graph/deps.dot
 
@@ -56,6 +123,7 @@ candidate = json.loads(Path("patchplan/out/candidate/cst.json").read_text())["fa
 compiler = json.loads(Path("patchplan/out/candidate/compiler.json").read_text())["compiler"]
 lsp = json.loads(Path("patchplan/out/candidate/lsp.json").read_text())["lsp"]
 vcs = json.loads(Path("patchplan/out/candidate/vcs.json").read_text())["vcs"]
+scope = json.loads(Path("patchplan/out/reports/scope-policy/scope.json").read_text())["scope"]
 
 payload = {
     "reportInput": {
@@ -64,6 +132,7 @@ payload = {
         "compiler": compiler,
         "lsp": lsp,
         "vcs": vcs,
+        "scope": scope,
     }
 }
 Path("patchplan/out/reports/report-input.json").write_text(json.dumps(payload, indent=2) + "\n")
@@ -88,6 +157,9 @@ mode = sys.argv[1]
 tier = sys.argv[2]
 report = json.loads(Path("patchplan/out/reports/report.json").read_text())["report"]
 graph = json.loads(Path("patchplan/out/graph/graph.json").read_text())
+patch_order = json.loads(Path("patchplan/out/graph/patch-order.json").read_text())["patchOrder"]
+patch_manifest = json.loads(Path("patchplan/out/patches/manifest.json").read_text())["patchManifest"]
+scope = json.loads(Path("patchplan/out/reports/scope-policy/scope.json").read_text())["scope"]
 lsp = json.loads(Path("patchplan/out/candidate/lsp.json").read_text())["lsp"]
 semantic = lsp.get("semanticSummary", {})
 semantic_nodes = lsp.get("semanticNodes", [])
@@ -176,6 +248,109 @@ ordered_md.write_text(ordered_markdown)
 if tier != "report":
     Path(f"patchplan/out/reports/ordered-symbols/{tier}.json").write_text(json.dumps(ordered_report, indent=2) + "\n")
     Path(f"patchplan/out/reports/ordered-symbols/{tier}.md").write_text(ordered_markdown)
+
+topology_report = {
+    "slice": "topological-order",
+    "mode": mode,
+    "tier": tier,
+    "accepted": (
+        not patch_order["hasCycle"]
+        and patch_order["deterministicLayerIDs"]
+        and not patch_order["duplicateLayerIDs"]
+        and patch_order["orderMatchesDeclared"]
+        and all(edge["respects"] for edge in patch_order["edgeChecks"])
+    ),
+    "note": "CUE accepted deterministic topological order",
+    "order": patch_order["order"],
+    "hasCycle": patch_order["hasCycle"],
+    "cycle": patch_order["cycle"],
+    "deterministicLayerIDs": patch_order["deterministicLayerIDs"],
+    "duplicateLayerIDs": patch_order["duplicateLayerIDs"],
+    "orderMatchesDeclared": patch_order["orderMatchesDeclared"],
+    "edgeViolationCount": len([edge for edge in patch_order["edgeChecks"] if not edge["respects"]]),
+    "edgeChecks": patch_order["edgeChecks"],
+}
+topology_path = Path("patchplan/out/reports/topological-order/report.json")
+topology_path.write_text(json.dumps(topology_report, indent=2) + "\n")
+topology_markdown = "\n".join([
+    "# Topological Order",
+    "",
+    f"- mode: {mode}",
+    f"- tier: {tier}",
+    f"- accepted: {str(topology_report['accepted']).lower()}",
+    f"- order: {', '.join(topology_report['order'])}",
+    f"- has cycle: {str(topology_report['hasCycle']).lower()}",
+    f"- deterministic layer IDs: {str(topology_report['deterministicLayerIDs']).lower()}",
+    f"- order matches declared: {str(topology_report['orderMatchesDeclared']).lower()}",
+    f"- edge violations: {len([edge for edge in topology_report['edgeChecks'] if not edge['respects']])}",
+    "",
+])
+Path("patchplan/out/reports/topological-order/report.md").write_text(topology_markdown)
+if tier != "report":
+    Path(f"patchplan/out/reports/topological-order/{tier}.json").write_text(json.dumps(topology_report, indent=2) + "\n")
+    Path(f"patchplan/out/reports/topological-order/{tier}.md").write_text(topology_markdown)
+
+patch_emission_report = {
+    "slice": "patch-emission",
+    "mode": mode,
+    "tier": tier,
+    "accepted": (
+        patch_manifest["applyCheck"]["ordered"]
+        and patch_manifest["applyCheck"]["ok"]
+        and any(
+            patch["layerID"] == "001-provide-logger-binding"
+            and patch["evidence"]["hasLoggerExport"]
+            for patch in patch_manifest["patches"]
+        )
+        and any(
+            patch["layerID"] == "002-rewrite-console-calls"
+            and patch["evidence"]["hasLoggerRewrite"]
+            for patch in patch_manifest["patches"]
+        )
+    ),
+    "patches": patch_manifest["patches"],
+    "applyCheck": patch_manifest["applyCheck"],
+}
+Path("patchplan/out/reports/patch-emission/report.json").write_text(json.dumps(patch_emission_report, indent=2) + "\n")
+patch_emission_markdown = "\n".join([
+    "# Patch Emission",
+    "",
+    f"- mode: {mode}",
+    f"- tier: {tier}",
+    f"- accepted: {str(patch_emission_report['accepted']).lower()}",
+    f"- ordered apply check: {str(patch_manifest['applyCheck']['ok']).lower()}",
+    *[f"- {patch['layerID']}: {patch['path']}" for patch in patch_manifest["patches"]],
+    "",
+])
+Path("patchplan/out/reports/patch-emission/report.md").write_text(patch_emission_markdown)
+if tier != "report":
+    Path(f"patchplan/out/reports/patch-emission/{tier}.json").write_text(json.dumps(patch_emission_report, indent=2) + "\n")
+    Path(f"patchplan/out/reports/patch-emission/{tier}.md").write_text(patch_emission_markdown)
+
+scope_report = {
+    "slice": "scope-policy",
+    "mode": mode,
+    "tier": tier,
+    "accepted": scope["ok"],
+    "checkedPaths": scope["checkedPaths"],
+    "violations": scope["violations"],
+    "violationCount": len(scope["violations"]),
+}
+Path("patchplan/out/reports/scope-policy/report.json").write_text(json.dumps(scope_report, indent=2) + "\n")
+scope_markdown = "\n".join([
+    "# Scope Policy",
+    "",
+    f"- mode: {mode}",
+    f"- tier: {tier}",
+    f"- accepted: {str(scope_report['accepted']).lower()}",
+    f"- checked paths: {len(scope_report['checkedPaths'])}",
+    f"- violations: {scope_report['violationCount']}",
+    "",
+])
+Path("patchplan/out/reports/scope-policy/report.md").write_text(scope_markdown)
+if tier != "report":
+    Path(f"patchplan/out/reports/scope-policy/{tier}.json").write_text(json.dumps(scope_report, indent=2) + "\n")
+    Path(f"patchplan/out/reports/scope-policy/{tier}.md").write_text(scope_markdown)
 print(f"accepted: {str(report['accepted']).lower()}")
 PY
 
