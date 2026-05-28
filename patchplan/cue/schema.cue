@@ -245,6 +245,128 @@ package patchplan
 	ok:           bool
 }
 
+#LifecycleProbeReport: {
+	probe: string
+	tier:  string
+	status: "pass" | "fail" | "missing"
+	passed: bool
+	failureDomain: string
+	authority: string
+	artifacts: [...string]
+	sourceReport?: string
+}
+
+#LifecycleReport: {
+	slice: "lifecycle"
+	accepted: bool
+
+	expectedPreservedReports: int & >=0
+	preservedReportCount:    int & >=0
+	missingReportCount:      int & >=0
+
+	goodCandidateAccepted: bool
+	badCandidateRejected:  bool
+	replayArtifactsPresent: bool
+
+	idempotenceFullPasses: int & >=0
+	idempotenceTiers: [...string]
+	stableHashes:           bool
+	stableSemanticOrdering: bool
+
+	completedProbes: [...#LifecycleProbeReport]
+	additionalReports?: [...string]
+
+	accepted: expectedPreservedReports == preservedReportCount &&
+		missingReportCount == 0 &&
+		goodCandidateAccepted &&
+		badCandidateRejected &&
+		replayArtifactsPresent &&
+		idempotenceFullPasses == 3 &&
+		stableHashes &&
+		stableSemanticOrdering
+}
+
+#ScopeRank: {
+	symbol:    10
+	file:      20
+	package:   30
+	module:    40
+	workspace: 50
+}
+
+#PatchStackStep: {
+	id: string
+
+	scope: "symbol" | "file" | "package" | "module" | "workspace"
+
+	operation: "rename" | "move" | "delete" | "extract" | "inline" | "adapt"
+
+	touches: [...string]
+	dependsOn: [...string]
+	order: int & >=1
+
+	evidence?: {
+		compiler?: string
+		scip?:     string
+		syntax?:   string
+	}
+}
+
+#PatchStackPlan: {
+	steps: [...#PatchStackStep]
+	accepted: bool
+}
+
+#PatchStackValidation: {
+	validScopeRanks:            bool
+	dependencyReferencesExist:  bool
+	noForwardDependencies:      bool
+	bottomUpOrder:              bool
+	deterministicOrder:         bool
+	duplicateStepIDs:           [...string]
+	rejectionReasons:           [...string]
+	accepted:                   bool
+
+	accepted: validScopeRanks &&
+		dependencyReferencesExist &&
+		noForwardDependencies &&
+		bottomUpOrder &&
+		deterministicOrder &&
+		len(duplicateStepIDs) == 0 &&
+		len(rejectionReasons) == 0
+}
+
+#PatchStackReport: {
+	slice: "patch-stack-plan"
+	case: string
+	accepted: bool
+	scopeOrder: [...string]
+	dependencyOrder: [...string]
+	rejectionReasons: [...string]
+}
+
+#AdapterPatchStackStep: {
+	stepID: string
+	scopeKind: "symbol" | "file" | "package" | "module" | "workspace"
+	op: "rename" | "move" | "delete" | "extract" | "inline" | "adapt"
+	paths: [...string]
+	deps: [...string]
+	ordinal: int & >=1
+
+	evidenceRefs?: {
+		compiler?: string
+		scip?:     string
+		syntax?:   string
+	}
+}
+
+#AdapterPatchStackFacts: {
+	adapter: string
+	source:  string
+	deterministicOrder: bool
+	steps: [...#AdapterPatchStackStep]
+}
+
 #Report: {
 	changeID: string
 
@@ -308,3 +430,7 @@ patchManifest?:  #PatchManifest
 scope?:          #ScopeFacts
 report?:         #Report
 reportInput?:    #ReportInput
+lifecycle?:      #LifecycleReport
+patchStack?:     #PatchStackPlan
+patchStackValidation?: #PatchStackValidation
+adapterPatchFacts?: #AdapterPatchStackFacts

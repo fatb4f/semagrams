@@ -7,6 +7,27 @@ trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/reports"
 
+patchplan/scripts/demo good lifecycle-good >/dev/null
+good_candidate_accepted="$(python3 - <<'PY'
+import json
+from pathlib import Path
+print(str(json.loads(Path("patchplan/out/reports/report.json").read_text())["report"]["accepted"]).lower())
+PY
+)"
+
+patchplan/scripts/demo bad lifecycle-bad >/dev/null
+bad_report_accepted="$(python3 - <<'PY'
+import json
+from pathlib import Path
+print(str(json.loads(Path("patchplan/out/reports/report.json").read_text())["report"]["accepted"]).lower())
+PY
+)"
+if cue vet patchplan/cue/schema.cue patchplan/cue/accept.cue patchplan/out/reports/report.json >/dev/null 2>&1; then
+  bad_cue_rejected=false
+else
+  bad_cue_rejected=true
+fi
+
 stash_reports() {
   local name="$1"
   local dir="$out/$name"
@@ -31,10 +52,43 @@ stash_reports scope-policy
 patchplan/scripts/idempotence-slice >/dev/null
 stash_reports idempotence
 
+additional_reports=()
+if [ -x patchplan/scripts/patch-stack-plan-slice ]; then
+  patchplan/scripts/patch-stack-plan-slice >/dev/null
+  for path in \
+    patchplan/out/reports/patch-stack-plan-good.json \
+    patchplan/out/reports/patch-stack-plan-good.md \
+    patchplan/out/reports/patch-stack-plan-bad.json \
+    patchplan/out/reports/patch-stack-plan-bad.md \
+    patchplan/out/reports/patch-stack-plan-summary.json \
+    patchplan/out/reports/patch-stack-plan-summary.md
+  do
+    if [ -f "$path" ]; then
+      additional_reports+=("$path")
+    fi
+  done
+fi
+
+if [ -x patchplan/scripts/adapter-patch-stack-slice ]; then
+  patchplan/scripts/adapter-patch-stack-slice >/dev/null
+  for path in \
+    patchplan/out/reports/adapter-patch-stack-good.json \
+    patchplan/out/reports/adapter-patch-stack-good.md \
+    patchplan/out/reports/adapter-patch-stack-bad.json \
+    patchplan/out/reports/adapter-patch-stack-bad.md \
+    patchplan/out/reports/adapter-patch-stack-summary.json \
+    patchplan/out/reports/adapter-patch-stack-summary.md
+  do
+    if [ -f "$path" ]; then
+      additional_reports+=("$path")
+    fi
+  done
+fi
+
 mkdir -p "$out"
 cp -R "$tmp/reports"/* "$out"/
 
-python3 - "$tmp/reports" "$out/lifecycle.json" "$out/lifecycle.md" <<'PY'
+python3 - "$tmp/reports" "$out/lifecycle.json" "$out/lifecycle.md" "$good_candidate_accepted" "$bad_report_accepted" "$bad_cue_rejected" "${additional_reports[@]}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -42,6 +96,10 @@ from pathlib import Path
 reports_root = Path(sys.argv[1])
 json_path = Path(sys.argv[2])
 md_path = Path(sys.argv[3])
+good_candidate_accepted = sys.argv[4] == "true"
+bad_report_accepted = sys.argv[5] == "true"
+bad_cue_rejected = sys.argv[6] == "true"
+additional_reports = sys.argv[7:]
 
 probe_meta = {
     "topological-order": {
@@ -88,11 +146,14 @@ probe_meta = {
 
 tiers = ["failure-domain", "tiny", "medium", "large"]
 completed = []
+missing_count = 0
+preserved_count = 0
 for probe, meta in probe_meta.items():
     probe_dir = reports_root / probe
     for tier in tiers:
         path = probe_dir / f"{tier}.json"
         if not path.exists():
+            missing_count += 1
             completed.append({
                 "probe": probe,
                 "tier": tier,
@@ -103,6 +164,7 @@ for probe, meta in probe_meta.items():
                 "artifacts": meta["artifacts"],
             })
             continue
+        preserved_count += 1
         data = json.loads(path.read_text())
         passed = bool(data.get("accepted"))
         completed.append({
@@ -136,11 +198,55 @@ completion_answers = {
     "failureDomainWhenItFails": "Each lifecycle probe entry carries a failureDomain; known failed scope-policy case is classified as model-design.",
 }
 
-all_passed = all(item["passed"] for item in completed)
+idempotence_tiers = ["tiny", "medium", "large"]
+idempotence_reports = []
+for tier in idempotence_tiers:
+    path = reports_root / "idempotence" / f"{tier}.json"
+    if path.exists():
+        idempotence_reports.append(json.loads(path.read_text()))
+
+idempotence_full_passes = 3 if (
+    len(idempotence_reports) == 3 and
+    all(report.get("accepted") and report.get("runCount") == 3 for report in idempotence_reports)
+) else 0
+stable_hashes = bool(idempotence_reports) and all(report.get("stableHashes") for report in idempotence_reports)
+stable_semantic_ordering = bool(idempotence_reports) and all(report.get("semanticOrderStable") for report in idempotence_reports)
+
+replay_artifacts = [
+    Path("patchplan/out/patches/001-provide-logger-binding.patch"),
+    Path("patchplan/out/patches/002-rewrite-console-calls.patch"),
+    Path("patchplan/out/patches/manifest.json"),
+    Path("patchplan/out/graph/patch-order.json"),
+]
+replay_artifacts_present = all(path.exists() for path in replay_artifacts)
+
+expected_preserved_reports = 20
+bad_candidate_rejected = (not bad_report_accepted) and bad_cue_rejected
 payload = {
     "slice": "lifecycle",
-    "accepted": all_passed,
+    "accepted": (
+        preserved_count == expected_preserved_reports
+        and missing_count == 0
+        and good_candidate_accepted
+        and bad_candidate_rejected
+        and replay_artifacts_present
+        and idempotence_full_passes == 3
+        and stable_hashes
+        and stable_semantic_ordering
+        and all(item["passed"] for item in completed)
+    ),
+    "expectedPreservedReports": expected_preserved_reports,
+    "preservedReportCount": preserved_count,
+    "missingReportCount": missing_count,
+    "goodCandidateAccepted": good_candidate_accepted,
+    "badCandidateRejected": bad_candidate_rejected,
+    "replayArtifactsPresent": replay_artifacts_present,
+    "idempotenceFullPasses": idempotence_full_passes,
+    "idempotenceTiers": idempotence_tiers,
+    "stableHashes": stable_hashes,
+    "stableSemanticOrdering": stable_semantic_ordering,
     "completedProbes": completed,
+    "additionalReports": additional_reports,
     "knownFailedProbe": known_failed,
     "greenLightAuthority": "CUE remains the acceptance authority: scripts emit facts, CUE validates/derives/gates acceptance.",
     "knownLimitations": [
@@ -160,6 +266,14 @@ lines = [
     "# Lifecycle Report",
     "",
     f"- accepted: {str(payload['accepted']).lower()}",
+    f"- expected preserved reports: {payload['expectedPreservedReports']}",
+    f"- preserved reports: {payload['preservedReportCount']}",
+    f"- missing reports: {payload['missingReportCount']}",
+    f"- good candidate accepted: {str(payload['goodCandidateAccepted']).lower()}",
+    f"- bad candidate rejected: {str(payload['badCandidateRejected']).lower()}",
+    f"- idempotence full passes: {payload['idempotenceFullPasses']}",
+    f"- stable hashes: {str(payload['stableHashes']).lower()}",
+    f"- stable semantic ordering: {str(payload['stableSemanticOrdering']).lower()}",
     f"- green-light authority: {payload['greenLightAuthority']}",
     f"- next recommended probe: {payload['nextRecommendedProbe']}",
     "",
@@ -168,6 +282,13 @@ lines = [
 ]
 for item in completed:
     lines.append(f"- {item['probe']} / {item['tier']}: {item['status']} ({item['failureDomain']})")
+if additional_reports:
+    lines.extend([
+        "",
+        "## Additional Preserved Reports",
+        "",
+    ])
+    lines.extend(f"- {path}" for path in additional_reports)
 lines.extend([
     "",
     "## Known Failed Probe",
@@ -190,6 +311,8 @@ lines.extend([
 ])
 md_path.write_text("\n".join(lines))
 PY
+
+cue vet patchplan/cue/schema.cue patchplan/cue/lifecycle.cue "$out/lifecycle.json"
 
 printf 'lifecycle reports:\n'
 printf '  patchplan/out/reports/lifecycle.json\n'

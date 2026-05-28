@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-adapter-patch-stack.$$"
+out="patchplan/out/reports"
+facts_out="patchplan/out/adapter"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp" "$out" "$facts_out"
+
+python3 - "$tmp" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+fixtures = {
+    "good": {
+        "adapter": "synthetic-patch-stack-adapter",
+        "source": "slice-14-good",
+        "deterministicOrder": True,
+        "steps": [
+            {
+                "stepID": "001-symbol-private-leaf",
+                "scopeKind": "symbol",
+                "op": "rename",
+                "paths": ["src/domain.ts#privateName"],
+                "deps": [],
+                "ordinal": 1,
+                "evidenceRefs": {"syntax": "adapter-shaped-fixture"},
+            },
+            {
+                "stepID": "002-file-local-adapter",
+                "scopeKind": "file",
+                "op": "adapt",
+                "paths": ["src/domain.ts"],
+                "deps": ["001-symbol-private-leaf"],
+                "ordinal": 2,
+                "evidenceRefs": {"syntax": "adapter-shaped-fixture"},
+            },
+            {
+                "stepID": "003-package-boundary",
+                "scopeKind": "package",
+                "op": "adapt",
+                "paths": ["src/index.ts"],
+                "deps": ["002-file-local-adapter"],
+                "ordinal": 3,
+                "evidenceRefs": {"syntax": "adapter-shaped-fixture"},
+            },
+            {
+                "stepID": "004-workspace-integration",
+                "scopeKind": "workspace",
+                "op": "adapt",
+                "paths": ["tsconfig.json"],
+                "deps": ["003-package-boundary"],
+                "ordinal": 4,
+                "evidenceRefs": {"syntax": "adapter-shaped-fixture"},
+            },
+        ],
+    },
+    "top-down": {
+        "adapter": "synthetic-patch-stack-adapter",
+        "source": "slice-14-top-down",
+        "deterministicOrder": True,
+        "steps": [
+            {
+                "stepID": "001-workspace-integration",
+                "scopeKind": "workspace",
+                "op": "adapt",
+                "paths": ["tsconfig.json"],
+                "deps": ["002-package-boundary"],
+                "ordinal": 1,
+            },
+            {
+                "stepID": "002-package-boundary",
+                "scopeKind": "package",
+                "op": "adapt",
+                "paths": ["src/index.ts"],
+                "deps": ["003-file-local-adapter"],
+                "ordinal": 2,
+            },
+            {
+                "stepID": "003-file-local-adapter",
+                "scopeKind": "file",
+                "op": "adapt",
+                "paths": ["src/domain.ts"],
+                "deps": ["004-symbol-private-leaf"],
+                "ordinal": 3,
+            },
+            {
+                "stepID": "004-symbol-private-leaf",
+                "scopeKind": "symbol",
+                "op": "rename",
+                "paths": ["src/domain.ts#privateName"],
+                "deps": [],
+                "ordinal": 4,
+            },
+        ],
+    },
+    "forward-dependency": {
+        "adapter": "synthetic-patch-stack-adapter",
+        "source": "slice-14-forward-dependency",
+        "deterministicOrder": True,
+        "steps": [
+            {
+                "stepID": "001-symbol-private-leaf",
+                "scopeKind": "symbol",
+                "op": "rename",
+                "paths": ["src/domain.ts#privateName"],
+                "deps": ["002-file-local-adapter"],
+                "ordinal": 1,
+            },
+            {
+                "stepID": "002-file-local-adapter",
+                "scopeKind": "file",
+                "op": "adapt",
+                "paths": ["src/domain.ts"],
+                "deps": [],
+                "ordinal": 2,
+            },
+        ],
+    },
+    "scope-inversion": {
+        "adapter": "synthetic-patch-stack-adapter",
+        "source": "slice-14-scope-inversion",
+        "deterministicOrder": True,
+        "steps": [
+            {
+                "stepID": "001-workspace-integration",
+                "scopeKind": "workspace",
+                "op": "adapt",
+                "paths": ["tsconfig.json"],
+                "deps": ["002-symbol-private-leaf"],
+                "ordinal": 1,
+            },
+            {
+                "stepID": "002-symbol-private-leaf",
+                "scopeKind": "symbol",
+                "op": "rename",
+                "paths": ["src/domain.ts#privateName"],
+                "deps": [],
+                "ordinal": 2,
+            },
+        ],
+    },
+}
+
+for name, facts in fixtures.items():
+    payload = {"adapterPatchFacts": facts}
+    (root / f"{name}-adapter.json").write_text(json.dumps(payload, indent=2) + "\n")
+PY
+
+render_case() {
+  local name="$1"
+  cue export \
+    patchplan/cue/schema.cue \
+    patchplan/cue/adapter-patch-stack.cue \
+    "$tmp/$name-adapter.json" \
+    --out json \
+    > "$tmp/$name-normalized.json"
+  cp "$tmp/$name-adapter.json" "$facts_out/patch-stack-$name.json"
+  cp "$tmp/$name-normalized.json" "$facts_out/patch-stack-$name-normalized.json"
+}
+
+validate_case() {
+  local name="$1"
+  if cue vet \
+    patchplan/cue/schema.cue \
+    patchplan/cue/adapter-patch-stack.cue \
+    patchplan/cue/patch-stack.cue \
+    "$tmp/$name-adapter.json" \
+    > "$tmp/$name.log" 2>&1; then
+    printf true
+  else
+    printf false
+  fi
+}
+
+for name in good top-down forward-dependency scope-inversion; do
+  render_case "$name"
+done
+
+good_cue_pass="$(validate_case good)"
+top_down_cue_pass="$(validate_case top-down)"
+forward_dependency_cue_pass="$(validate_case forward-dependency)"
+scope_inversion_cue_pass="$(validate_case scope-inversion)"
+
+python3 - "$tmp" "$out" "$facts_out" "$good_cue_pass" "$top_down_cue_pass" "$forward_dependency_cue_pass" "$scope_inversion_cue_pass" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+tmp = Path(sys.argv[1])
+out = Path(sys.argv[2])
+facts_out = Path(sys.argv[3])
+cue_results = {
+    "good": sys.argv[4] == "true",
+    "top-down": sys.argv[5] == "true",
+    "forward-dependency": sys.argv[6] == "true",
+    "scope-inversion": sys.argv[7] == "true",
+}
+
+def load(name):
+    return json.loads((tmp / f"{name}-normalized.json").read_text())
+
+def scope_order(steps):
+    return [f"{step['order']}:{step['scope']}:{step['id']}" for step in sorted(steps, key=lambda item: item["order"])]
+
+def dependency_order(steps):
+    return [f"{dep}->{step['id']}" for step in steps for dep in step["dependsOn"]]
+
+def case_payload(name):
+    normalized = load(name)
+    stack = normalized["patchStack"]
+    validation = normalized["patchStackValidation"]
+    return {
+        "case": name,
+        "cueAccepted": cue_results[name],
+        "stackAccepted": stack["accepted"],
+        "scopeOrder": scope_order(stack["steps"]),
+        "dependencyOrder": dependency_order(stack["steps"]),
+        "rejectionReasons": validation["rejectionReasons"],
+        "adapterFacts": f"patchplan/out/adapter/patch-stack-{name}.json",
+        "normalizedFacts": f"patchplan/out/adapter/patch-stack-{name}-normalized.json",
+    }
+
+good_case = case_payload("good")
+bad_cases = [case_payload(name) for name in ["top-down", "forward-dependency", "scope-inversion"]]
+
+good_report = {
+    "slice": "adapter-patch-stack",
+    "case": "good",
+    "accepted": good_case["cueAccepted"],
+    "adapterAccepted": good_case["stackAccepted"],
+    "scopeOrder": good_case["scopeOrder"],
+    "dependencyOrder": good_case["dependencyOrder"],
+    "rejectionReasons": good_case["rejectionReasons"],
+    "adapterFacts": good_case["adapterFacts"],
+    "normalizedFacts": good_case["normalizedFacts"],
+}
+
+bad_report = {
+    "slice": "adapter-patch-stack",
+    "case": "bad",
+    "accepted": False,
+    "allRejected": all(not case["cueAccepted"] for case in bad_cases),
+    "scopeOrder": bad_cases[0]["scopeOrder"],
+    "dependencyOrder": bad_cases[0]["dependencyOrder"],
+    "rejectionReasons": sorted({reason for case in bad_cases for reason in case["rejectionReasons"]}),
+    "cases": [
+        {
+            "case": case["case"],
+            "cueRejected": not case["cueAccepted"],
+            "adapterAccepted": case["stackAccepted"],
+            "scopeOrder": case["scopeOrder"],
+            "dependencyOrder": case["dependencyOrder"],
+            "rejectionReasons": case["rejectionReasons"],
+            "adapterFacts": case["adapterFacts"],
+            "normalizedFacts": case["normalizedFacts"],
+        }
+        for case in bad_cases
+    ],
+}
+
+summary = {
+    "slice": "adapter-patch-stack",
+    "accepted": good_report["accepted"] and bad_report["allRejected"],
+    "goodAccepted": good_report["accepted"],
+    "topDownRejected": bad_report["cases"][0]["cueRejected"],
+    "forwardDependencyRejected": bad_report["cases"][1]["cueRejected"],
+    "scopeInversionRejected": bad_report["cases"][2]["cueRejected"],
+    "adapterFacts": sorted(str(path) for path in facts_out.glob("patch-stack-*.json")),
+    "cueContract": "patchplan/cue/patch-stack.cue",
+    "adapterRenderer": "patchplan/cue/adapter-patch-stack.cue",
+}
+
+out.mkdir(parents=True, exist_ok=True)
+(out / "adapter-patch-stack-good.json").write_text(json.dumps(good_report, indent=2) + "\n")
+(out / "adapter-patch-stack-bad.json").write_text(json.dumps(bad_report, indent=2) + "\n")
+(out / "adapter-patch-stack-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+(out / "adapter-patch-stack-good.md").write_text("\n".join([
+    "# Adapter Patch Stack",
+    "",
+    "- case: good",
+    f"- accepted: {str(good_report['accepted']).lower()}",
+    f"- adapter facts: {good_report['adapterFacts']}",
+    f"- normalized facts: {good_report['normalizedFacts']}",
+    f"- scope order: {', '.join(good_report['scopeOrder'])}",
+    f"- dependency order: {', '.join(good_report['dependencyOrder'])}",
+    "- rejection reasons: 0",
+    "",
+]))
+
+bad_lines = [
+    "# Adapter Patch Stack",
+    "",
+    "- case: bad",
+    f"- accepted: {str(bad_report['accepted']).lower()}",
+    f"- all rejected: {str(bad_report['allRejected']).lower()}",
+    "",
+]
+for case in bad_report["cases"]:
+    bad_lines.extend([
+        f"## {case['case']}",
+        "",
+        f"- CUE rejected: {str(case['cueRejected']).lower()}",
+        f"- adapter accepted: {str(case['adapterAccepted']).lower()}",
+        f"- adapter facts: {case['adapterFacts']}",
+        f"- normalized facts: {case['normalizedFacts']}",
+        f"- scope order: {', '.join(case['scopeOrder'])}",
+        f"- dependency order: {', '.join(case['dependencyOrder'])}",
+        f"- rejection reasons: {', '.join(case['rejectionReasons'])}",
+        "",
+    ])
+(out / "adapter-patch-stack-bad.md").write_text("\n".join(bad_lines))
+
+(out / "adapter-patch-stack-summary.md").write_text("\n".join([
+    "# Adapter Patch Stack Summary",
+    "",
+    f"- accepted: {str(summary['accepted']).lower()}",
+    f"- good accepted: {str(summary['goodAccepted']).lower()}",
+    f"- top-down rejected: {str(summary['topDownRejected']).lower()}",
+    f"- forward dependency rejected: {str(summary['forwardDependencyRejected']).lower()}",
+    f"- scope inversion rejected: {str(summary['scopeInversionRejected']).lower()}",
+    f"- CUE contract: {summary['cueContract']}",
+    f"- adapter renderer: {summary['adapterRenderer']}",
+    "",
+]))
+
+if not summary["accepted"]:
+    raise SystemExit(1)
+PY
+
+printf 'adapter-patch-stack reports:\n'
+printf '  patchplan/out/reports/adapter-patch-stack-good.json\n'
+printf '  patchplan/out/reports/adapter-patch-stack-good.md\n'
+printf '  patchplan/out/reports/adapter-patch-stack-bad.json\n'
+printf '  patchplan/out/reports/adapter-patch-stack-bad.md\n'
+printf '  patchplan/out/reports/adapter-patch-stack-summary.json\n'
+printf '  patchplan/out/reports/adapter-patch-stack-summary.md\n'

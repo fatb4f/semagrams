@@ -813,96 +813,490 @@ Run generated fixture three times.
 
 ---
 
-# Slice 12: lifecycle report
+Below are the two bounded slices as separate implementation prompts.
 
-## Purpose
+---
 
-Make validation status self-reporting and reviewable.
+# Slice 12 — Lifecycle proof harness
 
-## Failure domain
+## Current state
 
-Primary:
-
-```text
-UX-cognitive-load
-```
-
-Secondary:
+This is now:
 
 ```text
-evidence-integrity
+patchplan can run individual slice proofs:
+  topological-order
+  patch-emission
+  patch-replay
+  scope-policy
+  idempotence
 ```
 
-## Target artifacts
+But the system needs a stable harness proving that outputs are:
+
+```text
+preserved
+replayable
+CUE-accepted or CUE-rejected correctly
+idempotent across reruns
+summarized as lifecycle evidence
+```
+
+Slice 12 is **not** the initial thesis proof. It is the proof harness that makes Slice 13 trustworthy.
+
+## Target state
+
+Slice 12 should establish:
+
+```text
+lifecycle acceptance =
+  all required reports preserved
+  + good path CUE-accepted
+  + bad path CUE-rejected
+  + replay artifacts present
+  + idempotence stable
+  + lifecycle report emitted
+```
+
+Expected final verification:
+
+```text
+expected preserved reports: 20
+missing reports: 0
+lifecycle accepted: true
+idempotence: 3 full passes across tiny/medium/large
+stable hashes: true
+stable semantic ordering: true
+```
+
+## Path of least resistance
+
+Keep this as a lifecycle/reporting slice.
+
+Do not introduce new semantics. Use existing slice outputs and make the lifecycle layer validate them.
+
+Required scripts:
+
+```sh
+patchplan/scripts/demo good
+patchplan/scripts/demo bad
+patchplan/scripts/topological-order-slice
+patchplan/scripts/patch-emission-slice
+patchplan/scripts/patch-replay-slice
+patchplan/scripts/scope-policy-slice
+patchplan/scripts/idempotence-slice
+patchplan/scripts/lifecycle-slice
+```
+
+Required generated files:
 
 ```text
 patchplan/out/reports/lifecycle.json
 patchplan/out/reports/lifecycle.md
+
+patchplan/out/reports/
+patchplan/out/patches/
+patchplan/out/graph/
+patchplan/out/candidate/
 ```
 
-## Report must include
+CUE schemas/validators should cover:
 
 ```text
-completed probes
-pass/fail status
-failure domain
-scale tier
-artifacts generated
-green-light authority
-known limitations
-next recommended probe
+topology
+patch-emission
+patch-replay
+scope-policy
+patch-order
+patch-manifest
+scope facts
+idempotence
+lifecycle
 ```
 
-## Tiers
+## Heads-up
 
-### Failure-domain fixture
+Do **not** make Slice 12 carry the theory proof.
 
-Lifecycle report includes a known failed probe and explains the domain.
+Keep out of scope:
 
-### Tier 1: tiny
+```text
+SCIP
+tree-sitter
+compiler adapters
+symbol refactoring
+graph mutation semantics
+nearest common dominator
+general patch synthesis
+```
 
-Current probe lifecycle.
+Known limitations are acceptable:
 
-### Tier 2: medium
+```text
+LSP remains editor-scoped / focused adapter boundary.
+Patch emission remains migration-shape specific.
+```
 
-Multi-file lifecycle.
+## Codex-ready prompt
 
-### Tier 3: large/synthetic
+```text
+Implement Slice 12: lifecycle proof harness for patchplan.
 
-Generated lifecycle.
+Current state:
+- Existing slice scripts cover:
+  - topological-order
+  - patch-emission
+  - patch-replay
+  - scope-policy
+  - idempotence
+- Good and bad demo paths exist.
+- Patch artifacts, graph artifacts, candidate artifacts, and reports are emitted under patchplan/out/.
+- Slice 12 should be the lifecycle proof harness, not the initial thesis proof.
 
-## Pass criteria
+Target state:
+- Add or complete a lifecycle slice that proves preserved reports, replay, idempotence, and CUE acceptance.
+- The lifecycle slice must emit:
+  - patchplan/out/reports/lifecycle.json
+  - patchplan/out/reports/lifecycle.md
+- The lifecycle report must preserve and summarize reports from:
+  - topological-order
+  - patch-emission
+  - patch-replay
+  - scope-policy
+  - idempotence
+- Expected preserved reports: 20.
+- Missing reports must be counted explicitly.
+- Good candidate must be accepted by CUE.
+- Bad candidate must be rejected by CUE intentionally.
+- Idempotence must run 3 full passes across tiny/medium/large and report stable hashes plus stable semantic ordering.
 
-* Lifecycle report is generated.
-* Failed probes are classified by failure domain.
-* Passing probes identify the authority source.
-* Report is usable for reassessment.
+Commands to run:
+- patchplan/scripts/demo good
+- patchplan/scripts/demo bad
+- patchplan/scripts/topological-order-slice
+- patchplan/scripts/patch-emission-slice
+- patchplan/scripts/patch-replay-slice
+- patchplan/scripts/scope-policy-slice
+- patchplan/scripts/idempotence-slice
+- patchplan/scripts/lifecycle-slice
+
+CUE work:
+- Add or verify schemas/validators for:
+  - topology
+  - patch-emission
+  - patch-replay
+  - scope-policy
+  - patch-order
+  - patch-manifest
+  - scope facts
+  - lifecycle
+  - idempotence
+- Avoid broad semantic expansion.
+- Do not introduce SCIP, tree-sitter, compiler adapter, LSP, or graph mutation work in this slice.
+
+Acceptance:
+- patchplan/scripts/demo good reports accepted: true.
+- patchplan/scripts/demo bad reports accepted: false and fails CUE intentionally.
+- patchplan/scripts/lifecycle-slice reports:
+  - expected preserved reports: 20
+  - missing reports: 0
+  - lifecycle accepted: true
+- patchplan/scripts/idempotence-slice reports:
+  - 3 full passes
+  - tiny/medium/large covered
+  - stable hashes
+  - stable semantic ordering
+- Generated files include:
+  - patchplan/out/reports/lifecycle.json
+  - patchplan/out/reports/lifecycle.md
+  - preserved slice/tier reports under patchplan/out/reports/
+  - patch artifacts under patchplan/out/patches/
+  - graph/model/report artifacts under patchplan/out/graph/, patchplan/out/candidate/, and patchplan/out/reports/
+
+Report back with:
+- commands run
+- whether good passed
+- whether bad rejected
+- generated files
+- CUE schema/validator changes
+- dependency/tool limitations
+- final lifecycle verification
+- idempotence verification
+```
+
+## Slice 12 acceptance sentence
+
+```text
+Slice 12 is complete when lifecycle acceptance proves that all required slice reports are preserved, replay/idempotence are stable, good is CUE-accepted, and bad is CUE-rejected.
+```
 
 ---
 
-# Completion criteria
+# Slice 13 — Initial thesis proof: CUE bottom-up patch stack
 
-This issue is complete when the probe can answer:
+## Current state
 
-```text
-1. Is the candidate accepted?
-2. Why or why not?
-3. Which facts support that decision?
-4. Which graph edges explain the decision?
-5. Which patch layer addresses the missing obligation?
-6. Can the patch layers be replayed from clean base?
-7. Does this remain stable across size tiers?
-8. Which failure domain applies when it fails?
-```
-
-## Final reassessment checkpoint
-
-After Slice 12, reassess:
+The thesis is now:
 
 ```text
-Is patchplan-probe still a fixture-specific proof,
-or has it become a reusable patch-planning substrate?
+CUE provides an ordered patch stack plan,
+respecting bottom-up scope.
 ```
 
+Slice 12 proves the lifecycle harness. Slice 13 should prove the thesis directly.
+
+The system already has some ordering, patch-emission, patch-replay, scope-policy, and lifecycle machinery. But it now needs a focused proof that CUE can accept or reject a patch stack based on bottom-up scope constraints.
+
+## Target state
+
+Slice 13 should prove:
+
+```text
+Given scoped patch steps,
+CUE validates a deterministic ordered patch stack,
+accepts valid bottom-up order,
+and rejects invalid top-down or dependency-inverted order.
 ```
+
+Core invariant:
+
+```text
+lower-scope patches must precede higher-scope patches
+when the higher-scope patch depends on them.
+```
+
+Example accepted order:
+
+```text
+symbol/private leaf
+  → file/local adapter
+  → package boundary
+  → module/workspace integration
+```
+
+Example rejected order:
+
+```text
+workspace integration
+  → package boundary
+  → file/local adapter
+  → symbol/private leaf
+```
+
+## Path of least resistance
+
+Start with synthetic patch steps. Do not require SCIP/tree-sitter/compiler yet.
+
+Define a small scope lattice:
+
+```text
+symbol    = 10
+file      = 20
+package   = 30
+module    = 40
+workspace = 50
+```
+
+Define a patch stack IR:
+
+```cue
+#PatchStep: {
+	id: string
+
+	scope: "symbol" | "file" | "package" | "module" | "workspace"
+
+	operation: "rename" | "move" | "delete" | "extract" | "inline" | "adapt"
+
+	touches: [...string]
+
+	dependsOn: [...string]
+
+	order: int
+
+	evidence?: {
+		compiler?: string
+		scip?:     string
+		syntax?:   string
+	}
+}
+```
+
+Define a stack plan:
+
+```cue
+#PatchStackPlan: {
+	steps: [...#PatchStep]
+	accepted: bool
+}
+```
+
+The first proof can be purely structural:
+
+```text
+valid scope rank order
+valid dependsOn references
+no dependency points forward
+no parent/higher-scope patch precedes required child/lower-scope patch
+deterministic semantic order
+```
+
+## Heads-up
+
+Do not overbuild this into semantic code understanding.
+
+Keep out of scope:
+
+```text
+SCIP integration
+tree-sitter integration
+compiler adapter integration
+LSP integration
+actual rename execution
+graph mutation algebra
+nearest common dominator
+cross-repo impact
+large graph traversal
+```
+
+The purpose is to prove that **CUE owns the ordered patch stack plan**, not that CUE understands source code.
+
+Adapters can come later as fact producers.
+
+## Codex-ready prompt
+
+```text
+Implement Slice 13: initial thesis proof — CUE bottom-up patch stack.
+
+Theory:
+- CUE provides an ordered patch stack plan, respecting bottom-up scope.
+
+Current state:
+- Slice 12 provides the lifecycle proof harness.
+- Existing slices cover topological ordering, patch emission, patch replay, scope policy, idempotence, and lifecycle reporting.
+- The next proof should directly validate the thesis:
+  - CUE accepts valid bottom-up scoped patch stacks.
+  - CUE rejects invalid top-down or dependency-inverted patch stacks.
+
+Target state:
+- Add a CUE-backed patch stack plan contract.
+- Define a minimal scope lattice:
+  - symbol: 10
+  - file: 20
+  - package: 30
+  - module: 40
+  - workspace: 50
+- Define a patch stack IR with:
+  - id
+  - scope
+  - operation
+  - touches
+  - dependsOn
+  - order
+  - optional evidence refs
+- Add good and bad fixtures:
+  - good: symbol -> file -> package -> workspace
+  - bad: workspace -> package -> file -> symbol
+  - bad dependency: a step depends on a later step
+  - bad scope: a higher-scope dependent patch appears before required lower-scope patch
+- CUE must validate the good stack and reject the bad stacks.
+
+Required outputs:
+- patchplan/out/reports/patch-stack-plan-good.json
+- patchplan/out/reports/patch-stack-plan-good.md
+- patchplan/out/reports/patch-stack-plan-bad.json
+- patchplan/out/reports/patch-stack-plan-bad.md
+- optional:
+  - patchplan/out/reports/patch-stack-plan-summary.json
+  - patchplan/out/reports/patch-stack-plan-summary.md
+
+Required CUE contracts:
+- #ScopeRank
+- #PatchStep
+- #PatchStackPlan
+- #PatchStackValidation
+- bottom-up ordering constraint
+- dependency existence constraint
+- dependency-before-dependent constraint
+- deterministic order constraint
+
+Constraints:
+- Keep this as a pure thesis proof.
+- Do not add SCIP, tree-sitter, compiler adapter, or LSP integration.
+- Do not implement real patch application.
+- Do not implement graph mutation semantics.
+- Do not implement nearest common dominator logic.
+- Do not expand patch emission beyond existing migration-shape-specific behavior.
+- Adapters may later provide facts, but this slice should use synthetic patch-stack fixtures.
+
+Expected command shape:
+- Add a script such as:
+  - patchplan/scripts/patch-stack-plan-slice
+- The script should:
+  - generate or validate the good patch stack fixture
+  - generate or validate bad patch stack fixtures
+  - run CUE validation
+  - emit JSON and Markdown reports
+  - return non-zero only for unexpected failures, not for intentional negative fixtures
+
+Acceptance:
+- Good bottom-up stack is accepted.
+- Top-down stack is rejected.
+- Forward dependency stack is rejected.
+- Higher-scope-before-required-lower-scope stack is rejected.
+- Reports clearly state:
+  - accepted true/false
+  - scope order
+  - dependency order
+  - rejection reason for bad fixtures
+- Lifecycle can preserve the patch-stack-plan report after Slice 13 is connected to the lifecycle harness.
+- Existing Slice 12 behavior remains green.
+
+Report back with:
+- files changed
+- commands run
+- good stack result
+- bad stack result
+- CUE schemas added
+- reports generated
+- whether Slice 12 lifecycle remains green
+- known limitations
+```
+
+## Slice 13 acceptance sentence
+
+```text
+Slice 13 is complete when CUE accepts a valid bottom-up patch stack, rejects invalid scope/dependency orderings, emits patch-stack-plan reports, and preserves Slice 12 lifecycle stability.
+```
+
+---
+
+# Combined sequence
+
+Run Slice 12 first:
+
+```text
+prove lifecycle harness
+```
+
+Then run Slice 13:
+
+```text
+prove initial thesis under that harness
+```
+
+The dependency is:
+
+```text
+Slice 12:
+  Can we trust the evidence lifecycle?
+
+Slice 13:
+  Can CUE validate the bottom-up ordered patch stack?
+```
+
+Compact stack:
+
+```text
+Slice 12 = proof harness
+Slice 13 = initial thesis proof
 ```
