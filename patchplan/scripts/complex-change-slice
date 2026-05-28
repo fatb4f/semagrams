@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-complex-change.$$"
+out_root="patchplan/out/complex-change"
+patch_out="patchplan/out/patches/complex-change"
+report_out="patchplan/out/reports"
+adapter_out="patchplan/out/adapter"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp" "$out_root" "$patch_out" "$report_out" "$adapter_out"
+
+python3 - "$out_root" "$patch_out" "$adapter_out" <<'PY'
+import difflib
+import hashlib
+import json
+import py_compile
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+out_root = Path(sys.argv[1])
+patch_out = Path(sys.argv[2])
+adapter_out = Path(sys.argv[3])
+fixture_before = Path("patchplan/fixtures/complex-change/before")
+fixture_after = Path("patchplan/fixtures/complex-change/after")
+
+for path in [out_root / "before", out_root / "after", out_root / "replayed", patch_out]:
+    if path.exists():
+        shutil.rmtree(path)
+patch_out.mkdir(parents=True, exist_ok=True)
+shutil.copytree(fixture_before, out_root / "before")
+shutil.copytree(fixture_after, out_root / "after")
+shutil.copytree(fixture_before, out_root / "replayed")
+
+steps = [
+    {
+        "id": "001-rename-private-helper",
+        "scope": "symbol",
+        "operation": "rename",
+        "touches": ["src/lib.py"],
+        "dependsOn": [],
+        "order": 1,
+        "title": "rename private helper",
+        "before": fixture_before / "src/lib.py",
+        "after": fixture_after / "src/lib.py",
+        "patch": patch_out / "001-rename-private-helper.patch",
+    },
+    {
+        "id": "002-adapt-file-api",
+        "scope": "file",
+        "operation": "adapt",
+        "touches": ["src/app.py"],
+        "dependsOn": ["001-rename-private-helper"],
+        "order": 2,
+        "title": "adapt file API",
+        "before": fixture_before / "src/app.py",
+        "after": fixture_after / "src/app.py",
+        "patch": patch_out / "002-adapt-file-api.patch",
+    },
+    {
+        "id": "003-update-package-test",
+        "scope": "package",
+        "operation": "adapt",
+        "touches": ["tests/test_app.py"],
+        "dependsOn": ["002-adapt-file-api"],
+        "order": 3,
+        "title": "update package test",
+        "before": fixture_before / "tests/test_app.py",
+        "after": fixture_after / "tests/test_app.py",
+        "patch": patch_out / "003-update-package-test.patch",
+    },
+]
+
+def write_patch(step):
+    before_lines = step["before"].read_text().splitlines(keepends=True)
+    after_lines = step["after"].read_text().splitlines(keepends=True)
+    rel = step["touches"][0]
+    patch = difflib.unified_diff(
+        before_lines,
+        after_lines,
+        fromfile=f"a/{rel}",
+        tofile=f"b/{rel}",
+    )
+    step["patch"].write_text("".join(patch))
+
+for step in steps:
+    write_patch(step)
+
+replay_ok = True
+apply_results = []
+for step in steps:
+    result = subprocess.run(
+        ["git", "-C", str(out_root / "replayed"), "apply", str(Path.cwd() / step["patch"])],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    ok = result.returncode == 0
+    replay_ok = replay_ok and ok
+    apply_results.append({
+        "step": step["id"],
+        "patch": str(step["patch"]),
+        "ok": ok,
+        "stderr": result.stderr,
+    })
+
+diff_result = subprocess.run(
+    ["diff", "-ru", str(out_root / "after"), str(out_root / "replayed")],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+replay_matches = diff_result.returncode == 0
+
+def source_hash(root):
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+def compile_root(root, name, target):
+    diagnostics = []
+    exit_code = 0
+    for source in sorted(root.rglob("*.py")):
+        try:
+            py_compile.compile(
+                str(source),
+                cfile=str(adapter_out / f"{name}-{source.relative_to(root).as_posix().replace('/', '-')}.pyc"),
+                doraise=True,
+            )
+        except py_compile.PyCompileError as exc:
+            exit_code = 1
+            diagnostics.append({
+                "file": str(source),
+                "message": str(exc),
+            })
+    payload = {
+        "adapter": "compiler",
+        "fixture": name,
+        "command": f"python3 -m py_compile {root}/**/*.py",
+        "accepted": exit_code == 0,
+        "exitCode": exit_code,
+        "sourceHash": source_hash(root),
+        "diagnostics": diagnostics,
+        "artifactPath": str(target),
+        "emittedAt": "deterministic",
+    }
+    target.write_text(json.dumps(payload, indent=2) + "\n")
+    return payload
+
+compiler_fact = compile_root(out_root / "replayed", "complex-change-replayed", adapter_out / "complex-change-compiler.json")
+
+broken = out_root / "broken"
+if broken.exists():
+    shutil.rmtree(broken)
+shutil.copytree(out_root / "replayed", broken)
+(broken / "src/app.py").write_text((broken / "src/app.py").read_text() + "\ndef broken(:\n")
+bad_compiler_fact = compile_root(broken, "complex-change-broken", adapter_out / "complex-change-compiler-bad.json")
+
+adapter_steps = [
+    {
+        "stepID": step["id"],
+        "scopeKind": step["scope"],
+        "op": step["operation"],
+        "paths": step["touches"],
+        "deps": step["dependsOn"],
+        "ordinal": step["order"],
+        "evidenceRefs": {
+            "compiler": compiler_fact["artifactPath"],
+        },
+    }
+    for step in steps
+]
+adapter_payload = {
+    "adapterPatchFacts": {
+        "adapter": "complex-change-fixture-adapter",
+        "source": "slice-16-complex-change",
+        "deterministicOrder": True,
+        "steps": adapter_steps,
+    },
+    "compilerEvidence": [compiler_fact],
+}
+(adapter_out / "complex-change-patch-stack-good.json").write_text(json.dumps(adapter_payload, indent=2) + "\n")
+
+bad_order_steps = [
+    {**adapter_steps[2], "ordinal": 1, "deps": ["002-adapt-file-api"]},
+    {**adapter_steps[1], "ordinal": 2, "deps": ["001-rename-private-helper"]},
+    {**adapter_steps[0], "ordinal": 3, "deps": []},
+]
+bad_order_payload = {
+    "adapterPatchFacts": {
+        "adapter": "complex-change-fixture-adapter",
+        "source": "slice-16-complex-change-bad-order",
+        "deterministicOrder": True,
+        "steps": bad_order_steps,
+    },
+    "compilerEvidence": [compiler_fact],
+}
+(adapter_out / "complex-change-patch-stack-bad-order.json").write_text(json.dumps(bad_order_payload, indent=2) + "\n")
+
+metadata = {
+    "steps": [
+        {
+            "id": step["id"],
+            "scope": step["scope"],
+            "operation": step["operation"],
+            "touches": step["touches"],
+            "dependsOn": step["dependsOn"],
+            "order": step["order"],
+            "patch": str(step["patch"]),
+        }
+        for step in steps
+    ],
+    "applyResults": apply_results,
+    "replayOK": replay_ok,
+    "replayMatches": replay_matches,
+    "diff": diff_result.stdout,
+    "compilerFact": compiler_fact,
+    "badCompilerFact": bad_compiler_fact,
+}
+(adapter_out / "complex-change-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+PY
+
+render_stack() {
+  local name="$1"
+  cue export \
+    patchplan/cue/schema.cue \
+    patchplan/cue/adapter-patch-stack.cue \
+    patchplan/cue/compiler-patch-stack.cue \
+    "$adapter_out/complex-change-patch-stack-$name.json" \
+    --out json \
+    > "$adapter_out/complex-change-patch-stack-$name-normalized.json"
+}
+
+validate_stack() {
+  local name="$1"
+  if cue vet \
+    patchplan/cue/schema.cue \
+    patchplan/cue/adapter-patch-stack.cue \
+    patchplan/cue/compiler-patch-stack.cue \
+    patchplan/cue/patch-stack.cue \
+    "$adapter_out/complex-change-patch-stack-$name.json" \
+    > "$tmp/$name.log" 2>&1; then
+    printf true
+  else
+    printf false
+  fi
+}
+
+render_stack good
+cue export \
+  patchplan/cue/schema.cue \
+  patchplan/cue/adapter-patch-stack.cue \
+  "$adapter_out/complex-change-patch-stack-bad-order.json" \
+  --out json \
+  > "$adapter_out/complex-change-patch-stack-bad-order-normalized.json"
+
+good_stack_pass="$(validate_stack good)"
+bad_order_pass="$(validate_stack bad-order)"
+
+python3 - "$adapter_out" "$report_out" "$good_stack_pass" "$bad_order_pass" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+adapter_out = Path(sys.argv[1])
+report_out = Path(sys.argv[2])
+good_stack_pass = sys.argv[3] == "true"
+bad_order_pass = sys.argv[4] == "true"
+
+metadata = json.loads((adapter_out / "complex-change-metadata.json").read_text())
+good_stack = json.loads((adapter_out / "complex-change-patch-stack-good-normalized.json").read_text())
+bad_order_stack = json.loads((adapter_out / "complex-change-patch-stack-bad-order-normalized.json").read_text())
+compiler_fact = metadata["compilerFact"]
+bad_compiler_fact = metadata["badCompilerFact"]
+
+plan_report = {
+    "slice": "complex-change",
+    "case": "plan",
+    "accepted": good_stack_pass and not bad_order_pass,
+    "goodStackAccepted": good_stack_pass,
+    "invalidOrderingRejected": not bad_order_pass,
+    "steps": metadata["steps"],
+    "goodRejectionReasons": good_stack["patchStackValidation"]["rejectionReasons"],
+    "badOrderRejectionReasons": bad_order_stack["patchStackValidation"]["rejectionReasons"],
+    "patchStack": "patchplan/out/adapter/complex-change-patch-stack-good.json",
+    "badOrderPatchStack": "patchplan/out/adapter/complex-change-patch-stack-bad-order.json",
+}
+replay_report = {
+    "slice": "complex-change",
+    "case": "replay",
+    "accepted": metadata["replayOK"] and metadata["replayMatches"],
+    "replayOK": metadata["replayOK"],
+    "replayMatches": metadata["replayMatches"],
+    "applyResults": metadata["applyResults"],
+    "patchDirectory": "patchplan/out/patches/complex-change",
+    "before": "patchplan/out/complex-change/before",
+    "replayed": "patchplan/out/complex-change/replayed",
+    "after": "patchplan/out/complex-change/after",
+}
+compiler_report = {
+    "slice": "complex-change",
+    "case": "compiler",
+    "accepted": compiler_fact["accepted"] and not bad_compiler_fact["accepted"],
+    "compilerAccepted": compiler_fact["accepted"],
+    "compilerExitCode": compiler_fact["exitCode"],
+    "compilerDiagnostics": compiler_fact["diagnostics"],
+    "badCompilerAccepted": bad_compiler_fact["accepted"],
+    "badCompilerExitCode": bad_compiler_fact["exitCode"],
+    "badCompilerDiagnostics": bad_compiler_fact["diagnostics"],
+    "compilerFact": compiler_fact["artifactPath"],
+    "badCompilerFact": bad_compiler_fact["artifactPath"],
+}
+summary = {
+    "slice": "complex-change",
+    "accepted": plan_report["accepted"] and replay_report["accepted"] and compiler_report["accepted"],
+    "planAccepted": plan_report["accepted"],
+    "replayAccepted": replay_report["accepted"],
+    "compilerAccepted": compiler_report["accepted"],
+    "patchArtifactsEmitted": all(Path(step["patch"]).exists() for step in metadata["steps"]),
+    "cueContract": "patchplan/cue/patch-stack.cue",
+}
+
+report_out.mkdir(parents=True, exist_ok=True)
+for name, payload in [
+    ("complex-change-plan", plan_report),
+    ("complex-change-replay", replay_report),
+    ("complex-change-compiler", compiler_report),
+    ("complex-change-summary", summary),
+]:
+    (report_out / f"{name}.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+(report_out / "complex-change-plan.md").write_text("\n".join([
+    "# Complex Change Plan",
+    "",
+    f"- accepted: {str(plan_report['accepted']).lower()}",
+    f"- good stack accepted: {str(plan_report['goodStackAccepted']).lower()}",
+    f"- invalid ordering rejected: {str(plan_report['invalidOrderingRejected']).lower()}",
+    f"- steps: {len(plan_report['steps'])}",
+    "",
+]))
+(report_out / "complex-change-replay.md").write_text("\n".join([
+    "# Complex Change Replay",
+    "",
+    f"- accepted: {str(replay_report['accepted']).lower()}",
+    f"- replay applies: {str(replay_report['replayOK']).lower()}",
+    f"- replay matches after: {str(replay_report['replayMatches']).lower()}",
+    f"- patch directory: {replay_report['patchDirectory']}",
+    "",
+]))
+(report_out / "complex-change-compiler.md").write_text("\n".join([
+    "# Complex Change Compiler",
+    "",
+    f"- accepted: {str(compiler_report['accepted']).lower()}",
+    f"- compiler accepted: {str(compiler_report['compilerAccepted']).lower()}",
+    f"- bad compiler accepted: {str(compiler_report['badCompilerAccepted']).lower()}",
+    f"- compiler fact: {compiler_report['compilerFact']}",
+    "",
+]))
+(report_out / "complex-change-summary.md").write_text("\n".join([
+    "# Complex Change Summary",
+    "",
+    f"- accepted: {str(summary['accepted']).lower()}",
+    f"- plan accepted: {str(summary['planAccepted']).lower()}",
+    f"- replay accepted: {str(summary['replayAccepted']).lower()}",
+    f"- compiler accepted: {str(summary['compilerAccepted']).lower()}",
+    f"- patch artifacts emitted: {str(summary['patchArtifactsEmitted']).lower()}",
+    f"- CUE contract: {summary['cueContract']}",
+    "",
+]))
+if not summary["accepted"]:
+    raise SystemExit(1)
+PY
+
+printf 'complex-change reports:\n'
+printf '  patchplan/out/reports/complex-change-plan.json\n'
+printf '  patchplan/out/reports/complex-change-plan.md\n'
+printf '  patchplan/out/reports/complex-change-replay.json\n'
+printf '  patchplan/out/reports/complex-change-replay.md\n'
+printf '  patchplan/out/reports/complex-change-compiler.json\n'
+printf '  patchplan/out/reports/complex-change-compiler.md\n'
+printf '  patchplan/out/reports/complex-change-summary.json\n'
+printf '  patchplan/out/reports/complex-change-summary.md\n'

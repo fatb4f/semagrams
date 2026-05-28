@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="${TMPDIR:-/tmp}/patchplan-compiler-facts.$$"
+out="patchplan/out/reports"
+adapter_out="patchplan/out/adapter"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp" "$out" "$adapter_out"
+
+run_fixture() {
+  local name="$1"
+  local fixture="patchplan/fixtures/compiler-facts/$name"
+  local target="$adapter_out/compiler-facts-$name.json"
+  python3 - "$name" "$fixture" "$target" <<'PY'
+import hashlib
+import json
+import py_compile
+import sys
+from pathlib import Path
+
+name, fixture_root, target_path = sys.argv[1:]
+fixture = Path(fixture_root)
+target = Path(target_path)
+source = fixture / "module.py"
+command = f"python3 -m py_compile {source}"
+diagnostics = []
+exit_code = 0
+try:
+    py_compile.compile(str(source), cfile=str(target.parent / f"compiler-facts-{name}.pyc"), doraise=True)
+except py_compile.PyCompileError as exc:
+    exit_code = 1
+    diagnostics.append({
+        "file": str(source),
+        "message": str(exc),
+    })
+
+payload = {
+    "adapter": "compiler",
+    "fixture": f"compiler-facts-{name}",
+    "command": command,
+    "accepted": exit_code == 0,
+    "exitCode": exit_code,
+    "sourceHash": hashlib.sha256(source.read_bytes()).hexdigest(),
+    "diagnostics": diagnostics,
+    "artifactPath": f"patchplan/out/adapter/compiler-facts-{name}.json",
+    "emittedAt": "deterministic",
+}
+target.write_text(json.dumps(payload, indent=2) + "\n")
+PY
+}
+
+write_stack() {
+  local name="$1"
+  local compiler_fact="$adapter_out/compiler-facts-$name.json"
+  local target="$adapter_out/compiler-patch-stack-$name.json"
+  python3 - "$name" "$compiler_fact" "$target" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+name, compiler_fact_path, target_path = sys.argv[1:]
+compiler_fact = json.loads(Path(compiler_fact_path).read_text())
+payload = {
+    "adapterPatchFacts": {
+        "adapter": "compiler-backed-patch-stack-adapter",
+        "source": f"slice-15-{name}",
+        "deterministicOrder": True,
+        "steps": [
+            {
+                "stepID": "001-compiler-validated-leaf",
+                "scopeKind": "symbol",
+                "op": "adapt",
+                "paths": [f"patchplan/fixtures/compiler-facts/{name}/module.py"],
+                "deps": [],
+                "ordinal": 1,
+                "evidenceRefs": {
+                    "compiler": compiler_fact["artifactPath"],
+                },
+            },
+        ],
+    },
+    "compilerEvidence": [compiler_fact],
+}
+Path(target_path).write_text(json.dumps(payload, indent=2) + "\n")
+PY
+}
+
+render_stack() {
+  local name="$1"
+  if [ "$name" = "good" ]; then
+    cue export \
+      patchplan/cue/schema.cue \
+      patchplan/cue/adapter-patch-stack.cue \
+      patchplan/cue/compiler-patch-stack.cue \
+      "$adapter_out/compiler-patch-stack-$name.json" \
+      --out json \
+      > "$adapter_out/compiler-patch-stack-$name-normalized.json"
+  else
+    cue export \
+      patchplan/cue/schema.cue \
+      patchplan/cue/adapter-patch-stack.cue \
+      "$adapter_out/compiler-patch-stack-$name.json" \
+      --out json \
+      > "$adapter_out/compiler-patch-stack-$name-normalized.json"
+  fi
+}
+
+validate_stack() {
+  local name="$1"
+  if cue vet \
+    patchplan/cue/schema.cue \
+    patchplan/cue/adapter-patch-stack.cue \
+    patchplan/cue/compiler-patch-stack.cue \
+    patchplan/cue/patch-stack.cue \
+    "$adapter_out/compiler-patch-stack-$name.json" \
+    > "$tmp/$name.log" 2>&1; then
+    printf true
+  else
+    printf false
+  fi
+}
+
+run_fixture good
+run_fixture bad
+write_stack good
+write_stack bad
+render_stack good
+render_stack bad
+
+good_cue_pass="$(validate_stack good)"
+bad_cue_pass="$(validate_stack bad)"
+
+python3 - "$adapter_out" "$out" "$good_cue_pass" "$bad_cue_pass" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+adapter_out = Path(sys.argv[1])
+out = Path(sys.argv[2])
+good_cue_pass = sys.argv[3] == "true"
+bad_cue_pass = sys.argv[4] == "true"
+
+def load(path):
+    return json.loads(path.read_text())
+
+good_fact = load(adapter_out / "compiler-facts-good.json")
+bad_fact = load(adapter_out / "compiler-facts-bad.json")
+good_stack = load(adapter_out / "compiler-patch-stack-good-normalized.json")
+bad_stack = load(adapter_out / "compiler-patch-stack-bad-normalized.json")
+
+good_report = {
+    "slice": "compiler-facts",
+    "case": "good",
+    "accepted": good_fact["accepted"],
+    "exitCode": good_fact["exitCode"],
+    "command": good_fact["command"],
+    "diagnostics": good_fact["diagnostics"],
+    "compilerFact": good_fact["artifactPath"],
+    "patchStackAccepted": good_cue_pass,
+    "patchStack": "patchplan/out/adapter/compiler-patch-stack-good.json",
+    "normalizedPatchStack": "patchplan/out/adapter/compiler-patch-stack-good-normalized.json",
+    "rejectionReasons": good_stack["patchStackValidation"]["rejectionReasons"],
+}
+bad_report = {
+    "slice": "compiler-facts",
+    "case": "bad",
+    "accepted": bad_fact["accepted"],
+    "exitCode": bad_fact["exitCode"],
+    "command": bad_fact["command"],
+    "diagnostics": bad_fact["diagnostics"],
+    "compilerFact": bad_fact["artifactPath"],
+    "patchStackAccepted": bad_cue_pass,
+    "failedEvidenceRejected": not bad_cue_pass,
+    "patchStack": "patchplan/out/adapter/compiler-patch-stack-bad.json",
+    "normalizedPatchStack": "patchplan/out/adapter/compiler-patch-stack-bad-normalized.json",
+    "rejectionReasons": (
+        bad_stack["patchStackValidation"]["rejectionReasons"]
+        + ([] if bad_cue_pass else [f"001-compiler-validated-leaf has no accepted compiler evidence at {bad_fact['artifactPath']}"])
+    ),
+}
+summary = {
+    "slice": "compiler-facts",
+    "accepted": (
+        good_report["accepted"]
+        and good_report["patchStackAccepted"]
+        and not bad_report["accepted"]
+        and bad_report["failedEvidenceRejected"]
+    ),
+    "goodCompilerAccepted": good_report["accepted"],
+    "badCompilerAccepted": bad_report["accepted"],
+    "compilerBackedPatchStackAccepted": good_report["patchStackAccepted"],
+    "failedCompilerEvidenceRejected": bad_report["failedEvidenceRejected"],
+    "cueContract": "patchplan/cue/patch-stack.cue",
+    "compilerEvidenceOverlay": "patchplan/cue/compiler-patch-stack.cue",
+}
+
+out.mkdir(parents=True, exist_ok=True)
+(out / "compiler-facts-good.json").write_text(json.dumps(good_report, indent=2) + "\n")
+(out / "compiler-facts-bad.json").write_text(json.dumps(bad_report, indent=2) + "\n")
+(out / "compiler-facts-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+(out / "compiler-facts-good.md").write_text("\n".join([
+    "# Compiler Facts",
+    "",
+    "- case: good",
+    f"- accepted: {str(good_report['accepted']).lower()}",
+    f"- exit code: {good_report['exitCode']}",
+    f"- patch stack accepted: {str(good_report['patchStackAccepted']).lower()}",
+    f"- compiler fact: {good_report['compilerFact']}",
+    "",
+]))
+(out / "compiler-facts-bad.md").write_text("\n".join([
+    "# Compiler Facts",
+    "",
+    "- case: bad",
+    f"- accepted: {str(bad_report['accepted']).lower()}",
+    f"- exit code: {bad_report['exitCode']}",
+    f"- failed evidence rejected: {str(bad_report['failedEvidenceRejected']).lower()}",
+    f"- diagnostics: {len(bad_report['diagnostics'])}",
+    f"- compiler fact: {bad_report['compilerFact']}",
+    "",
+]))
+(out / "compiler-facts-summary.md").write_text("\n".join([
+    "# Compiler Facts Summary",
+    "",
+    f"- accepted: {str(summary['accepted']).lower()}",
+    f"- good compiler accepted: {str(summary['goodCompilerAccepted']).lower()}",
+    f"- bad compiler accepted: {str(summary['badCompilerAccepted']).lower()}",
+    f"- compiler-backed patch stack accepted: {str(summary['compilerBackedPatchStackAccepted']).lower()}",
+    f"- failed compiler evidence rejected: {str(summary['failedCompilerEvidenceRejected']).lower()}",
+    f"- CUE contract: {summary['cueContract']}",
+    "",
+]))
+if not summary["accepted"]:
+    raise SystemExit(1)
+PY
+
+printf 'compiler-facts reports:\n'
+printf '  patchplan/out/reports/compiler-facts-good.json\n'
+printf '  patchplan/out/reports/compiler-facts-good.md\n'
+printf '  patchplan/out/reports/compiler-facts-bad.json\n'
+printf '  patchplan/out/reports/compiler-facts-bad.md\n'
+printf '  patchplan/out/reports/compiler-facts-summary.json\n'
+printf '  patchplan/out/reports/compiler-facts-summary.md\n'

@@ -85,6 +85,40 @@ if [ -x patchplan/scripts/adapter-patch-stack-slice ]; then
   done
 fi
 
+if [ -x patchplan/scripts/compiler-facts-slice ]; then
+  patchplan/scripts/compiler-facts-slice >/dev/null
+  for path in \
+    patchplan/out/reports/compiler-facts-good.json \
+    patchplan/out/reports/compiler-facts-good.md \
+    patchplan/out/reports/compiler-facts-bad.json \
+    patchplan/out/reports/compiler-facts-bad.md \
+    patchplan/out/reports/compiler-facts-summary.json \
+    patchplan/out/reports/compiler-facts-summary.md
+  do
+    if [ -f "$path" ]; then
+      additional_reports+=("$path")
+    fi
+  done
+fi
+
+if [ -x patchplan/scripts/complex-change-slice ]; then
+  patchplan/scripts/complex-change-slice >/dev/null
+  for path in \
+    patchplan/out/reports/complex-change-plan.json \
+    patchplan/out/reports/complex-change-plan.md \
+    patchplan/out/reports/complex-change-replay.json \
+    patchplan/out/reports/complex-change-replay.md \
+    patchplan/out/reports/complex-change-compiler.json \
+    patchplan/out/reports/complex-change-compiler.md \
+    patchplan/out/reports/complex-change-summary.json \
+    patchplan/out/reports/complex-change-summary.md
+  do
+    if [ -f "$path" ]; then
+      additional_reports+=("$path")
+    fi
+  done
+fi
+
 mkdir -p "$out"
 cp -R "$tmp/reports"/* "$out"/
 

@@ -367,6 +367,24 @@ package patchplan
 	steps: [...#AdapterPatchStackStep]
 }
 
+#CompilerSensorDiagnostic: {
+	file: string
+	line?: int & >=1
+	message: string
+}
+
+#CompilerSensorFacts: {
+	adapter: "compiler"
+	fixture: string
+	command: string
+	accepted: bool
+	exitCode: int & >=0
+	sourceHash: string
+	diagnostics: [...#CompilerSensorDiagnostic]
+	artifactPath: string
+	emittedAt?: string
+}
+
 #Report: {
 	changeID: string
 
@@ -434,3 +452,5 @@ lifecycle?:      #LifecycleReport
 patchStack?:     #PatchStackPlan
 patchStackValidation?: #PatchStackValidation
 adapterPatchFacts?: #AdapterPatchStackFacts
+compilerFact?: #CompilerSensorFacts
+compilerEvidence?: [...#CompilerSensorFacts]
